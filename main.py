@@ -4,8 +4,9 @@ import logging
 import sys
 from pathlib import Path
 
+from services import SteamPresenceService
 from sites.keydrop import KeyDropSite
-from sites.steam_playtime import SteamPlaytimeMonitor
+from sites.steam_playtime import SteamPlaytimeMonitor, format_hours_and_minutes
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSIONS_DIR = BASE_DIR / "sessions"
@@ -50,6 +51,7 @@ def main() -> None:
     balances_file = DATA_DIR / "balances.json"
     steam_playtime_file = DATA_DIR / "steam_playtime.json"
     steam_avatar_file = BASE_DIR / "images" / "keydrop.webp"
+    steam_presence_script = BASE_DIR / "cs2.js"
 
     logger.info("Comprobando requisito previo de horas recientes en Steam.")
     playtime_monitor = SteamPlaytimeMonitor(
@@ -57,6 +59,10 @@ def main() -> None:
         workspace_dir=DATA_DIR,
         data_file=steam_playtime_file,
         logger=logging.getLogger("daily_cases_bot.steam"),
+    )
+    steam_presence = SteamPresenceService(
+        script_path=steam_presence_script,
+        logger=logging.getLogger("daily_cases_bot.steam_presence"),
     )
 
     logger.info("Inicializando bot para KeyDrop.")
@@ -70,13 +76,19 @@ def main() -> None:
     )
 
     try:
+        steam_presence.start()
+        if not steam_presence.wait_until_ready():
+            logger.warning(
+                "Steam Presence no quedo listo. Revisa el login/2FA y vuelve a ejecutar."
+            )
+            return
         recent_hours = playtime_monitor.check_recent_hours_once()
         if recent_hours < playtime_monitor.minimum_hours:
             logger.warning(
-                "Counter-Strike 2 no cumple el requisito: %.1f / %.1f horas en las ultimas 2 semanas. "
+                "Counter-Strike 2 no cumple el requisito: %s / %s en las ultimas 2 semanas. "
                 "Cierro el programa sin ejecutar KeyDrop.",
-                recent_hours,
-                playtime_monitor.minimum_hours,
+                format_hours_and_minutes(recent_hours),
+                format_hours_and_minutes(playtime_monitor.minimum_hours),
             )
             return
         site.run()
@@ -85,6 +97,8 @@ def main() -> None:
     except Exception:
         logger.exception("Error no controlado en main.")
         input("El proceso sigue vivo. Pulsa Enter para cerrar.")
+    finally:
+        steam_presence.stop()
 
 
 if __name__ == "__main__":

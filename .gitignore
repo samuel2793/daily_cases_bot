@@ -34,3 +34,7 @@ sessions/*
 
 data/*
 !data/.gitkeep
+
+secrets/*
+!secrets/.gitkeep
+!secrets/steam_presence.example.json
