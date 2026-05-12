@@ -20,10 +20,16 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-DEFAULT_URL = "https://key-drop.com/es/daily-case"
+DEFAULT_URL = "https://key-drop.com/es"
 SITE_NAME = "keydrop"
 BALANCE_XPATH = (
     "//*[@id='app-root']/header/div[1]/div[2]/div[1]/div/div[3]/a/div[2]/p[1]/span/span[1]"
+)
+DAILY_CASE_ENTRY_XPATH = "//*[@id='app-root']/header/div[1]/div[1]/a[1]"
+FIRST_DAILY_CASE_XPATH = "//*[@id='daily-case-grid-list']/li[1]/div/a/img[2]"
+DAILY_CASE_OPEN_BUTTON_XPATH = "//*[@id='main-view']/div/div/section/div[2]/button"
+DAILY_CASE_OPEN_BUTTON_TEXT_XPATH = (
+    "//*[@id='main-view']/div/div/section/div[2]/button/span[2]"
 )
 LOGIN_PATTERN = re.compile(r"(iniciar sesi[oó]n|login|sign in)", re.IGNORECASE)
 
@@ -131,18 +137,22 @@ class KeyDropSite:
             try:
                 while True:
                     try:
-                        self.open_daily_case_page()
+                        self.open_home_page()
                         self.dismiss_cookie_banner()
                         self.ensure_authenticated()
                         self.dismiss_cookie_banner()
                         balance_text = self.read_balance_text()
                         balance_value = self.parse_balance_value(balance_text)
                         self.persist_balance(balance_text, balance_value)
+                        self.open_daily_case_overview()
+                        self.open_first_daily_case_level()
+                        button_text = self.inspect_daily_case_open_button()
 
                         save_session(self.context, self.session_file, self.logger)
                         self.logger.info(
-                            "Flujo de KeyDrop finalizado. Saldo detectado: %s",
+                            "Flujo de KeyDrop finalizado. Saldo detectado: %s | Boton daily case: %s",
                             balance_text,
+                            button_text or "no detectado",
                         )
                         return
                     except KeyboardInterrupt:
@@ -205,7 +215,7 @@ class KeyDropSite:
         self.page.bring_to_front()
         self.logger.info("Chromium visible iniciado.")
 
-    def open_daily_case_page(self) -> None:
+    def open_home_page(self) -> None:
         assert self.page is not None
 
         self.logger.info("Abriendo %s", self.url)
@@ -321,11 +331,53 @@ class KeyDropSite:
             site_name=SITE_NAME,
             balance_text=balance_text,
             balance_value=balance_value,
-            source_url=self.url,
+            source_url=self.page.url if self.page is not None else self.url,
             logger=self.logger,
         )
         if not saved:
             raise RuntimeError("No se pudo persistir el saldo capturado.")
+
+    def open_daily_case_overview(self) -> None:
+        assert self.page is not None
+
+        daily_case_link = self.page.locator(f"xpath={DAILY_CASE_ENTRY_XPATH}")
+        self.safe_click(daily_case_link, "enlace de cabecera a daily case")
+        self.page.wait_for_url(re.compile(r".*/daily-case(?:[/?#].*)?$"), timeout=15_000)
+        self.wait_for_page_ready()
+        self.human_delay(1.0, 1.8)
+
+    def open_first_daily_case_level(self) -> None:
+        assert self.page is not None
+
+        first_case = self.page.locator(f"xpath={FIRST_DAILY_CASE_XPATH}")
+        self.safe_click(first_case, "primera daily case")
+        self.page.wait_for_url(re.compile(r".*/daily-case/level/0(?:[/?#].*)?$"), timeout=15_000)
+        self.wait_for_page_ready()
+        self.human_delay(1.0, 1.8)
+
+    def inspect_daily_case_open_button(self) -> str | None:
+        assert self.page is not None
+
+        button_locator = self.page.locator(f"xpath={DAILY_CASE_OPEN_BUTTON_XPATH}")
+        text_locator = self.page.locator(f"xpath={DAILY_CASE_OPEN_BUTTON_TEXT_XPATH}")
+
+        try:
+            button_locator.wait_for(state="visible", timeout=12_000)
+            text_locator.wait_for(state="visible", timeout=12_000)
+        except PlaywrightTimeoutError:
+            self.logger.warning("No se encontro el boton de apertura de la daily case.")
+            return None
+
+        button_text = text_locator.inner_text(timeout=5_000).strip()
+        if not button_text:
+            self.logger.warning("El boton de apertura existe pero su texto esta vacio.")
+            return ""
+
+        self.logger.info(
+            "Boton de apertura de daily case detectado con texto: %s",
+            button_text,
+        )
+        return button_text
 
     def safe_click(
         self,
