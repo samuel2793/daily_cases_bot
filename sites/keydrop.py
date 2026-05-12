@@ -5,6 +5,7 @@ import logging
 import random
 import re
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -354,6 +355,37 @@ class KeyDropSite:
         self.page.wait_for_url(re.compile(r".*/daily-case/level/0(?:[/?#].*)?$"), timeout=15_000)
         self.wait_for_page_ready()
         self.human_delay(1.0, 1.8)
+
+    def get_first_daily_case_image_url(self) -> str:
+        assert self.page is not None
+
+        image_locator = self.page.locator(f"xpath={FIRST_DAILY_CASE_XPATH}")
+        image_locator.wait_for(state="visible", timeout=10_000)
+        image_url = image_locator.get_attribute("src")
+        if not image_url:
+            raise RuntimeError("La imagen de la primera daily case no tiene src.")
+
+        self.logger.info("Imagen de la primera daily case detectada: %s", image_url)
+        return image_url
+
+    def download_first_daily_case_image(self, target_path: Path) -> Path:
+        image_url = self.get_first_daily_case_image_url()
+        request = urllib.request.Request(
+            image_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                )
+            },
+        )
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            target_path.write_bytes(response.read())
+
+        self.logger.info("Imagen de daily case descargada a %s.", target_path)
+        return target_path
 
     def inspect_daily_case_open_button(self) -> str | None:
         assert self.page is not None
