@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from sites.keydrop import KeyDropSite
+from sites.steam_playtime import SteamPlaytimeMonitor
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSIONS_DIR = BASE_DIR / "sessions"
@@ -47,7 +48,16 @@ def main() -> None:
     session_file = SESSIONS_DIR / "session.json"
     steam_session_file = SESSIONS_DIR / "steam_session.json"
     balances_file = DATA_DIR / "balances.json"
+    steam_playtime_file = DATA_DIR / "steam_playtime.json"
     steam_avatar_file = BASE_DIR / "images" / "keydrop.webp"
+
+    logger.info("Comprobando requisito previo de horas recientes en Steam.")
+    playtime_monitor = SteamPlaytimeMonitor(
+        session_file=steam_session_file,
+        workspace_dir=DATA_DIR,
+        data_file=steam_playtime_file,
+        logger=logging.getLogger("daily_cases_bot.steam"),
+    )
 
     logger.info("Inicializando bot para KeyDrop.")
     site = KeyDropSite(
@@ -60,6 +70,15 @@ def main() -> None:
     )
 
     try:
+        recent_hours = playtime_monitor.check_recent_hours_once()
+        if recent_hours < playtime_monitor.minimum_hours:
+            logger.warning(
+                "Counter-Strike 2 no cumple el requisito: %.1f / %.1f horas en las ultimas 2 semanas. "
+                "Cierro el programa sin ejecutar KeyDrop.",
+                recent_hours,
+                playtime_monitor.minimum_hours,
+            )
+            return
         site.run()
     except KeyboardInterrupt:
         logger.info("Ejecucion interrumpida por el usuario.")
