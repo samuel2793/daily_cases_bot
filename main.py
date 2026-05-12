@@ -45,11 +45,16 @@ def main() -> None:
     ensure_runtime_dirs()
     logger = configure_logging()
     session_file = SESSIONS_DIR / "session.json"
+    steam_session_file = SESSIONS_DIR / "steam_session.json"
     balances_file = DATA_DIR / "balances.json"
+    steam_avatar_file = BASE_DIR / "images" / "keydrop.webp"
 
     logger.info("Inicializando bot para KeyDrop.")
     site = KeyDropSite(
         session_file=session_file,
+        steam_session_file=steam_session_file,
+        steam_avatar_file=steam_avatar_file,
+        steam_workspace_dir=DATA_DIR,
         balances_file=balances_file,
         logger=logging.getLogger("daily_cases_bot.keydrop"),
     )

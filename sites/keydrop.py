@@ -21,6 +21,8 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
+from .steam import SteamAvatarManager
+
 DEFAULT_URL = "https://key-drop.com/es"
 SITE_NAME = "keydrop"
 BALANCE_XPATH = (
@@ -32,7 +34,21 @@ DAILY_CASE_OPEN_BUTTON_XPATH = "//*[@id='main-view']/div/div/section/div[2]/butt
 DAILY_CASE_OPEN_BUTTON_TEXT_XPATH = (
     "//*[@id='main-view']/div/div/section/div[2]/button/span[2]"
 )
+DAILY_CASE_AVATAR_CHECK_BUTTON_XPATH = (
+    "//*[@id='main-view']/div/section[1]/div/div/div[2]/div[1]/button"
+)
+DAILY_CASE_AVATAR_CHECK_BUTTON_TEXT_XPATH = (
+    "//*[@id='main-view']/div/section[1]/div/div/div[2]/div[1]/button/span"
+)
 LOGIN_PATTERN = re.compile(r"(iniciar sesi[oó]n|login|sign in)", re.IGNORECASE)
+READY_TO_OPEN_PATTERN = re.compile(r"(abrir|open)", re.IGNORECASE)
+STEAM_REQUIREMENT_PATTERN = re.compile(r"(steam|avatar|perfil|profile|photo|foto)", re.IGNORECASE)
+AVATAR_RECHECK_PATTERN = re.compile(r"(comprobar|check again|retry|revisar)", re.IGNORECASE)
+AVATAR_VALID_PATTERN = re.compile(r"(avatar es v[aá]lido|avatar is valid|v[aá]lido|valid)", re.IGNORECASE)
+AVATAR_INVALID_PATTERN = re.compile(
+    r"(tu avatar es incorrecto|avatar incorrecto|your avatar is incorrect|invalid avatar)",
+    re.IGNORECASE,
+)
 
 
 def load_session(
@@ -122,6 +138,9 @@ def save_balance_snapshot(
 @dataclass(slots=True)
 class KeyDropSite:
     session_file: Path
+    steam_session_file: Path
+    steam_avatar_file: Path
+    steam_workspace_dir: Path
     balances_file: Path
     logger: logging.Logger
     url: str = DEFAULT_URL
@@ -137,6 +156,7 @@ class KeyDropSite:
 
             try:
                 while True:
+                    steam_manager: SteamAvatarManager | None = None
                     try:
                         self.open_home_page()
                         self.dismiss_cookie_banner()
@@ -147,7 +167,10 @@ class KeyDropSite:
                         self.persist_balance(balance_text, balance_value)
                         self.open_daily_case_overview()
                         self.open_first_daily_case_level()
-                        button_text = self.inspect_daily_case_open_button()
+                        steam_manager = self.prepare_daily_case_avatar_requirement()
+                        button_text = self.ensure_daily_case_ready_to_open()
+                        self.click_daily_case_open_button()
+                        self.human_delay(2.0, 4.0)
 
                         save_session(self.context, self.session_file, self.logger)
                         self.logger.info(
@@ -166,6 +189,8 @@ class KeyDropSite:
                             save_session(self.context, self.session_file, self.logger)
                         if not self.prompt_retry():
                             return
+                    finally:
+                        self.cleanup_steam_avatar_requirement(steam_manager)
             finally:
                 self.close()
 
@@ -410,6 +435,146 @@ class KeyDropSite:
             button_text,
         )
         return button_text
+
+    def prepare_daily_case_avatar_requirement(self) -> SteamAvatarManager | None:
+        avatar_check_text = self.inspect_avatar_check_button_text()
+        if not avatar_check_text:
+            self.logger.info(
+                "No se detecto boton de comprobacion de avatar. Se sigue con el flujo actual."
+            )
+            return None
+
+        if AVATAR_VALID_PATTERN.search(avatar_check_text):
+            self.logger.info("El avatar ya figura como valido en KeyDrop: %s", avatar_check_text)
+            return None
+
+        if not AVATAR_RECHECK_PATTERN.search(avatar_check_text):
+            self.logger.info(
+                "El boton de comprobacion de avatar no requiere accion adicional: %s",
+                avatar_check_text,
+            )
+            return None
+
+        steam_manager = self.apply_steam_avatar_requirement()
+        self.click_avatar_check_button()
+        self.verify_avatar_check_result()
+        return steam_manager
+
+    def ensure_daily_case_ready_to_open(self) -> str:
+        button_text = self.inspect_daily_case_open_button()
+        if button_text and self.is_ready_to_open(button_text):
+            return button_text
+
+        raise RuntimeError(
+            f"La daily case sigue sin estar lista para abrir. Texto actual del boton: {button_text or 'sin texto'}"
+        )
+
+    def apply_steam_avatar_requirement(self) -> SteamAvatarManager:
+        if not self.steam_avatar_file.exists():
+            raise FileNotFoundError(
+                f"No existe la imagen de avatar para Steam: {self.steam_avatar_file}"
+            )
+
+        steam_logger = logging.getLogger("daily_cases_bot.steam")
+        steam_manager = SteamAvatarManager(
+            session_file=self.steam_session_file,
+            workspace_dir=self.steam_workspace_dir,
+            logger=steam_logger,
+        )
+
+        try:
+            steam_manager.start()
+            steam_manager.backup_and_apply_from_file(self.steam_avatar_file)
+            self.logger.info("Avatar temporal de Steam aplicado para desbloquear la daily case.")
+            self.human_delay(2.0, 4.0)
+            return steam_manager
+        except Exception:
+            steam_manager.close()
+            raise
+
+    def cleanup_steam_avatar_requirement(
+        self, steam_manager: SteamAvatarManager | None
+    ) -> None:
+        if steam_manager is None:
+            return
+
+        try:
+            restored = steam_manager.restore_previous_avatar()
+            if not restored:
+                self.logger.warning(
+                    "No se pudo restaurar automaticamente el avatar original de Steam."
+                )
+        finally:
+            steam_manager.close()
+
+    def click_daily_case_open_button(self) -> None:
+        assert self.page is not None
+
+        button_locator = self.page.locator(f"xpath={DAILY_CASE_OPEN_BUTTON_XPATH}")
+        self.safe_click(button_locator, "boton de apertura de daily case")
+
+    def inspect_avatar_check_button_text(self) -> str | None:
+        assert self.page is not None
+
+        button_locator = self.page.locator(f"xpath={DAILY_CASE_AVATAR_CHECK_BUTTON_XPATH}")
+        text_locator = self.page.locator(f"xpath={DAILY_CASE_AVATAR_CHECK_BUTTON_TEXT_XPATH}")
+
+        try:
+            button_locator.wait_for(state="visible", timeout=5_000)
+            text_locator.wait_for(state="visible", timeout=5_000)
+        except PlaywrightTimeoutError:
+            return None
+
+        button_text = text_locator.inner_text(timeout=5_000).strip()
+        self.logger.info("Boton de comprobacion de avatar detectado con texto: %s", button_text)
+        return button_text
+
+    def click_avatar_check_button(self) -> None:
+        assert self.page is not None
+
+        button_locator = self.page.locator(f"xpath={DAILY_CASE_AVATAR_CHECK_BUTTON_XPATH}")
+        self.safe_click(button_locator, "boton de comprobacion de avatar")
+        self.human_delay(2.0, 4.0)
+
+    def verify_avatar_check_result(self) -> None:
+        assert self.page is not None
+
+        if self.detect_avatar_invalid_toast():
+            raise RuntimeError("KeyDrop ha indicado que el avatar de Steam es incorrecto.")
+
+        button_text = self.inspect_avatar_check_button_text()
+        if button_text and AVATAR_VALID_PATTERN.search(button_text):
+            self.logger.info("KeyDrop confirmo el avatar de Steam como valido.")
+            return
+
+        raise RuntimeError(
+            f"No se pudo confirmar la validez del avatar en KeyDrop. Estado actual: {button_text or 'sin texto'}"
+        )
+
+    def detect_avatar_invalid_toast(self) -> bool:
+        assert self.page is not None
+
+        toast_locators = [
+            self.page.get_by_text(AVATAR_INVALID_PATTERN).first,
+            self.page.locator("[class*='toast']:has-text('avatar')").first,
+            self.page.locator("[role='alert']:has-text('avatar')").first,
+        ]
+        toast = self.first_visible(toast_locators, timeout_ms=4_000)
+        if toast is None:
+            return False
+
+        try:
+            toast_text = toast.inner_text(timeout=2_000).strip()
+        except Exception:
+            toast_text = "toast de avatar incorrecto detectado"
+
+        self.logger.warning("Toast detectado en KeyDrop: %s", toast_text)
+        return True
+
+    def is_ready_to_open(self, button_text: str) -> bool:
+        if STEAM_REQUIREMENT_PATTERN.search(button_text):
+            return False
+        return bool(READY_TO_OPEN_PATTERN.search(button_text))
 
     def safe_click(
         self,
