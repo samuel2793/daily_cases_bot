@@ -99,6 +99,25 @@ client.on('refreshToken', (token) => {
 
 client.on('loggedOn', () => {
     console.log('Conectado');
+
+    const startTime = Date.now();
+
+    // Función para formatear el tiempo transcurrido en HH:MM:SS
+    function getTiempoTranscurrido() {
+        const tiempoSegundos = Math.floor((Date.now() - startTime) / 1000);
+        const horas = Math.floor(tiempoSegundos / 3600);
+        const minutos = Math.floor((tiempoSegundos % 3600) / 60);
+        const segundos = tiempoSegundos % 60;
+        return `${horas.toString().padStart(2, '0')}:${minutos
+            .toString()
+            .padStart(2, '0')}:${segundos.toString().padStart(2, '0')}`;
+    }
+
+    // Intervalo que actualiza el estado cada segundo
+    const interval = setInterval(() => {
+        process.stdout.write(`\rConectado | ${getTiempoTranscurrido()}`);
+    }, 1000);
+
     client.gamesPlayed([730]);
 });
 
