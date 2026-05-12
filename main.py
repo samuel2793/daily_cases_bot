@@ -9,11 +9,12 @@ from sites.keydrop import KeyDropSite
 BASE_DIR = Path(__file__).resolve().parent
 SESSIONS_DIR = BASE_DIR / "sessions"
 LOGS_DIR = BASE_DIR / "logs"
+DATA_DIR = BASE_DIR / "data"
 LOG_FILE = LOGS_DIR / "bot.log"
 
 
 def ensure_runtime_dirs() -> None:
-    for directory in (SESSIONS_DIR, LOGS_DIR):
+    for directory in (SESSIONS_DIR, LOGS_DIR, DATA_DIR):
         directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -44,10 +45,12 @@ def main() -> None:
     ensure_runtime_dirs()
     logger = configure_logging()
     session_file = SESSIONS_DIR / "session.json"
+    balances_file = DATA_DIR / "balances.json"
 
     logger.info("Inicializando bot para KeyDrop.")
     site = KeyDropSite(
         session_file=session_file,
+        balances_file=balances_file,
         logger=logging.getLogger("daily_cases_bot.keydrop"),
     )
 

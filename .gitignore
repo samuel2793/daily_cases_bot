@@ -31,3 +31,6 @@ logs/*
 
 sessions/*
 !sessions/.gitkeep
+
+data/*
+!data/.gitkeep

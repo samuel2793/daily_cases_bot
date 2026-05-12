@@ -6,6 +6,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,11 +21,11 @@ from playwright.sync_api import (
 )
 
 DEFAULT_URL = "https://key-drop.com/es/daily-case"
-LOGIN_PATTERN = re.compile(r"(iniciar sesi[oó]n|login|sign in)", re.IGNORECASE)
-DAILY_CASE_PATTERN = re.compile(
-    r"(daily\s*case|abrir gratis|open for free|abrir|open)",
-    re.IGNORECASE,
+SITE_NAME = "keydrop"
+BALANCE_XPATH = (
+    "//*[@id='app-root']/header/div[1]/div[2]/div[1]/div/div[3]/a/div[2]/p[1]/span/span[1]"
 )
+LOGIN_PATTERN = re.compile(r"(iniciar sesi[oó]n|login|sign in)", re.IGNORECASE)
 
 
 def load_session(
@@ -69,9 +70,52 @@ def save_session(
     return True
 
 
+def save_balance_snapshot(
+    balances_file: Path,
+    site_name: str,
+    balance_text: str,
+    balance_value: float | None,
+    source_url: str,
+    logger: logging.Logger | None = None,
+) -> bool:
+    payload = {
+        "site": site_name,
+        "balance_text": balance_text,
+        "balance_value": balance_value,
+        "source_url": source_url,
+        "captured_at": datetime.now().astimezone().isoformat(),
+    }
+
+    try:
+        balances_file.parent.mkdir(parents=True, exist_ok=True)
+
+        if balances_file.exists():
+            store = json.loads(balances_file.read_text(encoding="utf-8"))
+        else:
+            store = {}
+
+        site_store = store.setdefault(site_name, {"latest": None, "history": []})
+        site_store["latest"] = payload
+        site_store["history"].append(payload)
+
+        balances_file.write_text(
+            json.dumps(store, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        if logger:
+            logger.exception("No se pudo guardar el saldo en %s", balances_file)
+        return False
+
+    if logger:
+        logger.info("Saldo guardado para %s en %s.", site_name, balances_file)
+    return True
+
+
 @dataclass(slots=True)
 class KeyDropSite:
     session_file: Path
+    balances_file: Path
     logger: logging.Logger
     url: str = DEFAULT_URL
     headless: bool = False
@@ -91,13 +135,15 @@ class KeyDropSite:
                         self.dismiss_cookie_banner()
                         self.ensure_authenticated()
                         self.dismiss_cookie_banner()
-
-                        daily_button = self.find_daily_case_button()
-                        self.safe_click(daily_button, "boton del daily case")
-                        self.human_delay(2.0, 4.0)
+                        balance_text = self.read_balance_text()
+                        balance_value = self.parse_balance_value(balance_text)
+                        self.persist_balance(balance_text, balance_value)
 
                         save_session(self.context, self.session_file, self.logger)
-                        self.logger.info("Flujo de KeyDrop finalizado sin errores.")
+                        self.logger.info(
+                            "Flujo de KeyDrop finalizado. Saldo detectado: %s",
+                            balance_text,
+                        )
                         return
                     except KeyboardInterrupt:
                         raise
@@ -239,46 +285,47 @@ class KeyDropSite:
 
         self.safe_click(banner_button, "banner de cookies", allow_fail=True)
 
-    def find_daily_case_button(self) -> Locator:
+    def read_balance_text(self) -> str:
         assert self.page is not None
 
-        candidates = [
-            (
-                "role button por texto",
-                self.page.get_by_role("button", name=DAILY_CASE_PATTERN).first,
-            ),
-            (
-                "boton con texto Abrir gratis",
-                self.page.locator("button:has-text('Abrir gratis')").first,
-            ),
-            (
-                "boton con texto Open for free",
-                self.page.locator("button:has-text('Open for free')").first,
-            ),
-            (
-                "boton interno en contenedor daily",
-                self.page.locator("[class*='daily'] button").first,
-            ),
-            (
-                "enlace daily-case con boton",
-                self.page.locator("a[href*='daily-case'] button").first,
-            ),
-        ]
+        locator = self.page.locator(f"xpath={BALANCE_XPATH}")
+        locator.wait_for(state="visible", timeout=12_000)
+        self.human_delay(0.5, 1.0)
 
-        for description, locator in candidates:
-            try:
-                locator.wait_for(state="visible", timeout=2_500)
-                if locator.is_enabled():
-                    self.logger.info(
-                        "Boton del daily case detectado mediante '%s'.", description
-                    )
-                    return locator
-            except PlaywrightTimeoutError:
-                continue
+        balance_text = locator.inner_text(timeout=5_000).strip()
+        if not balance_text:
+            raise RuntimeError("El elemento del saldo esta visible pero vacio.")
 
-        raise RuntimeError(
-            "No se detecto el boton del daily case. Revisa si la UI cambio o si la cuenta no esta lista."
+        self.logger.info("Saldo extraido desde la cabecera de KeyDrop: %s", balance_text)
+        return balance_text
+
+    def parse_balance_value(self, balance_text: str) -> float | None:
+        cleaned = re.sub(r"[^\d,.\-]", "", balance_text).strip()
+        if not cleaned:
+            return None
+
+        if "," in cleaned and "." in cleaned:
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        elif "," in cleaned:
+            cleaned = cleaned.replace(",", ".")
+
+        try:
+            return float(cleaned)
+        except ValueError:
+            self.logger.warning("No se pudo convertir el saldo '%s' a numero.", balance_text)
+            return None
+
+    def persist_balance(self, balance_text: str, balance_value: float | None) -> None:
+        saved = save_balance_snapshot(
+            balances_file=self.balances_file,
+            site_name=SITE_NAME,
+            balance_text=balance_text,
+            balance_value=balance_value,
+            source_url=self.url,
+            logger=self.logger,
         )
+        if not saved:
+            raise RuntimeError("No se pudo persistir el saldo capturado.")
 
     def safe_click(
         self,
