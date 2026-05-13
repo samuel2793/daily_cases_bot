@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from services import SteamPresenceService
+from sites.bloodycase import BloodyCaseSite
 from sites.csgocases import CSGOCasesSite
 from sites.keydrop import KeyDropSite
 from sites.steam_playtime import SteamPlaytimeMonitor, format_hours_and_minutes
@@ -47,11 +48,13 @@ def configure_logging() -> logging.Logger:
 def main() -> None:
     ensure_runtime_dirs()
     logger = configure_logging()
+    bloodycase_session_file = SESSIONS_DIR / "bloodycase_session.json"
     csgocases_session_file = SESSIONS_DIR / "csgocases_session.json"
     session_file = SESSIONS_DIR / "session.json"
     steam_session_file = SESSIONS_DIR / "steam_session.json"
     balances_file = DATA_DIR / "balances.json"
     steam_playtime_file = DATA_DIR / "steam_playtime.json"
+    bloodycase_steam_avatar_file = BASE_DIR / "images" / "bloodycase.png"
     keydrop_steam_avatar_file = BASE_DIR / "images" / "keydrop.webp"
     csgocases_steam_avatar_file = BASE_DIR / "images" / "csgocases.png"
     steam_presence_script = BASE_DIR / "cs2.js"
@@ -79,6 +82,7 @@ def main() -> None:
     )
     keydrop_result = "not_started"
     csgocases_result = "not_started"
+    bloodycase_result = "not_started"
 
     try:
         recent_hours = playtime_monitor.check_recent_hours_once()
@@ -109,6 +113,16 @@ def main() -> None:
             logger=logging.getLogger("daily_cases_bot.csgocases"),
         )
         csgocases_result = csgocases_site.run()
+        logger.info("Inicializando bot para BloodyCase.")
+        bloodycase_site = BloodyCaseSite(
+            session_file=bloodycase_session_file,
+            steam_session_file=steam_session_file,
+            steam_avatar_file=bloodycase_steam_avatar_file,
+            balances_file=balances_file,
+            workspace_dir=DATA_DIR,
+            logger=logging.getLogger("daily_cases_bot.bloodycase"),
+        )
+        bloodycase_result = bloodycase_site.run()
     except KeyboardInterrupt:
         logger.info("Ejecucion interrumpida por el usuario.")
     except Exception:
@@ -120,12 +134,13 @@ def main() -> None:
     finally:
         steam_presence.stop()
         logger.info(
-            "Resumen final | Steam: %s | KeyDrop: %s | CSGOCases: %s",
+            "Resumen final | Steam: %s | KeyDrop: %s | CSGOCases: %s | BloodyCase: %s",
             format_hours_and_minutes(recent_hours)
             if "recent_hours" in locals()
             else "sin comprobar",
             keydrop_result,
             csgocases_result,
+            bloodycase_result,
         )
 
 
