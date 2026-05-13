@@ -7,6 +7,7 @@ import random
 import re
 import time
 import urllib.request
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from playwright.sync_api import (
 )
 
 STEAM_PROFILE_URL = "https://steamcommunity.com/my"
+STEAM_EDIT_PROFILE_URL = "https://steamcommunity.com/my/edit"
 STEAM_EDIT_AVATAR_URL = "https://steamcommunity.com/my/edit/avatar"
 STEAM_LOGIN_PATTERN = re.compile(r"(sign in|iniciar sesi[oó]n|login)", re.IGNORECASE)
 STEAM_SAVE_PATTERN = re.compile(r"(save|guardar)", re.IGNORECASE)
@@ -81,43 +83,73 @@ class SteamAvatarManager:
     context: BrowserContext | None = field(default=None, init=False)
     page: Page | None = field(default=None, init=False)
     playwright_manager: Any = field(default=None, init=False)
+    owns_playwright_manager: bool = field(default=False, init=False)
     backup_dir: Path = field(init=False)
     backup_file: Path = field(init=False)
     metadata_file: Path = field(init=False)
+    profile_dir: Path = field(init=False)
+    profile_metadata_file: Path = field(init=False)
 
     def __post_init__(self) -> None:
         self.backup_dir = self.workspace_dir / "steam_avatar"
         self.backup_file = self.backup_dir / "original_avatar"
         self.metadata_file = self.backup_dir / "metadata.json"
         self.backup_dir.mkdir(parents=True, exist_ok=True)
+        self.profile_dir = self.workspace_dir / "steam_profile"
+        self.profile_metadata_file = self.profile_dir / "metadata.json"
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
 
-    def start(self) -> None:
-        playwright_manager = sync_playwright().start()
+    def start(self, playwright: Playwright | None = None) -> None:
+        playwright_manager = playwright
+        owns_playwright_manager = False
+        if playwright_manager is None:
+            playwright_manager = sync_playwright().start()
+            owns_playwright_manager = True
+
         try:
             self._open_browser(playwright_manager)
             self.ensure_authenticated()
         except Exception:
-            playwright_manager.stop()
+            if owns_playwright_manager:
+                playwright_manager.stop()
             raise
         self.playwright_manager = playwright_manager
+        self.owns_playwright_manager = owns_playwright_manager
 
     def close(self) -> None:
         if self.context is not None:
+            page_closed = False
+            if self.page is not None:
+                try:
+                    page_closed = self.page.is_closed()
+                except Exception:
+                    page_closed = True
+
+            if not page_closed:
+                try:
+                    save_session(self.context, self.session_file, self.logger)
+                except Exception:
+                    self.logger.exception("Fallo al guardar la sesion de Steam durante el cierre.")
+
             try:
-                save_session(self.context, self.session_file, self.logger)
+                self.context.close()
             except Exception:
-                self.logger.exception("Fallo al guardar la sesion de Steam durante el cierre.")
-            self.context.close()
+                self.logger.exception("Fallo al cerrar el contexto de Steam.")
             self.context = None
+            self.page = None
 
         if self.browser is not None:
-            self.browser.close()
+            try:
+                self.browser.close()
+            except Exception:
+                self.logger.exception("Fallo al cerrar Chromium de Steam.")
             self.browser = None
 
         playwright_manager = self.playwright_manager
-        if playwright_manager is not None:
+        if playwright_manager is not None and self.owns_playwright_manager:
             playwright_manager.stop()
-            self.playwright_manager = None
+        self.playwright_manager = None
+        self.owns_playwright_manager = False
 
     def backup_and_apply_from_url(self, image_url: str) -> Path:
         original_avatar = self.backup_current_avatar()
@@ -159,6 +191,171 @@ class SteamAvatarManager:
         self.apply_avatar_from_file(backup_path)
         self.logger.info("Avatar original de Steam restaurado desde %s.", backup_path)
         return True
+
+    def backup_and_apply_profile_name_suffix(self, suffix: str) -> str:
+        current_name = self.backup_current_profile_name()
+        updated_name = self.build_profile_name_with_suffix(current_name, suffix)
+        self.apply_profile_name(updated_name)
+        self.logger.info(
+            "Nick temporal aplicado en Steam. Original: %s | Temporal: %s",
+            current_name,
+            updated_name,
+        )
+        return updated_name
+
+    def backup_and_apply_profile_name_prefix_suffix(
+        self,
+        suffix: str,
+        prefix_length: int = 3,
+    ) -> str:
+        current_name = self.backup_current_profile_name()
+        updated_name = self.build_profile_name_with_prefix_suffix(
+            current_name,
+            suffix,
+            prefix_length=prefix_length,
+        )
+        self.apply_profile_name(updated_name)
+        self.logger.info(
+            "Nick temporal corto aplicado en Steam. Original: %s | Temporal: %s",
+            current_name,
+            updated_name,
+        )
+        return updated_name
+
+    def restore_previous_profile_name(self) -> bool:
+        if not self.profile_metadata_file.exists():
+            self.logger.warning("No hay metadata de backup para restaurar el nick de Steam.")
+            return False
+
+        try:
+            metadata = json.loads(self.profile_metadata_file.read_text(encoding="utf-8"))
+        except Exception:
+            self.logger.exception("No se pudo leer la metadata de backup del nick de Steam.")
+            return False
+
+        original_name = str(metadata.get("original_profile_name", "")).strip()
+        if not original_name:
+            self.logger.warning("La metadata de backup del nick de Steam no contiene un valor valido.")
+            return False
+
+        self.apply_profile_name(original_name)
+        self.logger.info("Nick original de Steam restaurado: %s", original_name)
+        return True
+
+    def backup_current_profile_name(self) -> str:
+        current_name = self.get_current_profile_name()
+        self.profile_metadata_file.write_text(
+            json.dumps(
+                {
+                    "original_profile_name": current_name,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        self.logger.info("Nick actual de Steam guardado: %s", current_name)
+        return current_name
+
+    def get_current_profile_name(self) -> str:
+        assert self.page is not None
+
+        self.page.goto(STEAM_EDIT_PROFILE_URL, wait_until="domcontentloaded")
+        self.wait_for_page_ready()
+
+        profile_name_input = self.find_profile_name_input()
+        if profile_name_input is None:
+            raise RuntimeError("No se encontro el campo del nick de Steam.")
+
+        current_name = (profile_name_input.input_value(timeout=5_000) or "").strip()
+        if not current_name:
+            raise RuntimeError("El campo del nick de Steam esta vacio.")
+
+        self.logger.info("Nick actual de Steam detectado: %s", current_name)
+        return current_name
+
+    def build_profile_name_with_suffix(self, current_name: str, suffix: str) -> str:
+        normalized_current_name = " ".join(current_name.split()).strip()
+        normalized_suffix = " ".join(suffix.split()).strip()
+        if not normalized_suffix:
+            raise ValueError("El sufijo del nick de Steam no puede estar vacio.")
+
+        if normalized_suffix.casefold() in normalized_current_name.casefold():
+            return normalized_current_name
+
+        if normalized_current_name:
+            return f"{normalized_current_name} {normalized_suffix}"
+        return normalized_suffix
+
+    def build_profile_name_with_prefix_suffix(
+        self,
+        current_name: str,
+        suffix: str,
+        prefix_length: int = 3,
+    ) -> str:
+        normalized_suffix = " ".join(suffix.split()).strip()
+        if not normalized_suffix:
+            raise ValueError("El sufijo del nick de Steam no puede estar vacio.")
+        if prefix_length <= 0:
+            raise ValueError("El numero de caracteres del prefijo debe ser mayor que cero.")
+
+        prefix = self.extract_profile_name_prefix(current_name, prefix_length)
+        if not prefix:
+            raise RuntimeError("No se pudo derivar un prefijo corto valido del nick actual de Steam.")
+
+        return f"{prefix} {normalized_suffix}"
+
+    def extract_profile_name_prefix(self, current_name: str, prefix_length: int) -> str:
+        compact_name = " ".join(current_name.split()).strip()
+        if not compact_name:
+            return ""
+
+        useful_chars: list[str] = []
+        for char in compact_name:
+            category = unicodedata.category(char)
+            if category.startswith(("L", "N")):
+                useful_chars.append(char)
+            if len(useful_chars) >= prefix_length:
+                break
+
+        if len(useful_chars) >= prefix_length:
+            return "".join(useful_chars)
+
+        fallback_chars = [char for char in compact_name if not char.isspace()]
+        return "".join(fallback_chars[:prefix_length])
+
+    def apply_profile_name(self, profile_name: str) -> None:
+        assert self.page is not None
+
+        normalized_name = " ".join(profile_name.split()).strip()
+        if not normalized_name:
+            raise ValueError("El nick de Steam no puede estar vacio.")
+
+        self.page.goto(STEAM_EDIT_PROFILE_URL, wait_until="domcontentloaded")
+        self.wait_for_page_ready()
+
+        profile_name_input = self.find_profile_name_input()
+        if profile_name_input is None:
+            raise RuntimeError("No se encontro el campo del nick de Steam.")
+
+        profile_name_input.click(timeout=5_000)
+        self.human_delay(0.2, 0.6)
+        profile_name_input.fill(normalized_name, timeout=10_000)
+        self.human_delay(0.8, 1.5)
+
+        save_button = self.first_visible(
+            [
+                self.page.get_by_role("button", name=STEAM_SAVE_PATTERN).first,
+                self.page.locator("input[type='submit'][value*='Save']").first,
+                self.page.locator("input[type='submit'][value*='Guardar']").first,
+            ],
+            timeout_ms=10_000,
+        )
+        if save_button is None:
+            raise RuntimeError("No se encontro el boton para guardar el nick en Steam.")
+
+        self.safe_click(save_button, "guardar nick en Steam")
+        self.human_delay(2.0, 3.5)
 
     def backup_current_avatar(self) -> Path:
         profile_avatar_url = self.get_current_avatar_url()
@@ -250,7 +447,7 @@ class SteamAvatarManager:
             return (full_score + medium_penalty, len(source))
 
         normalized_sources.sort(key=avatar_score, reverse=True)
-        self.logger.info("Candidatos de avatar Steam detectados: %s", normalized_sources)
+        self.logger.debug("Candidatos de avatar Steam detectados: %s", normalized_sources)
         return normalized_sources[0]
 
     def looks_like_avatar_url(self, source: str) -> bool:
@@ -298,7 +495,18 @@ class SteamAvatarManager:
 
         self.safe_click(save_button, "guardar avatar en Steam")
         self.human_delay(2.0, 3.5)
-        save_session(self.context, self.session_file, self.logger)
+
+    def find_profile_name_input(self) -> Locator | None:
+        assert self.page is not None
+
+        return self.first_visible(
+            [
+                self.page.locator("input[name='personaName']").first,
+                self.page.locator("#personaName").first,
+                self.page.locator("input[name='profileName']").first,
+            ],
+            timeout_ms=10_000,
+        )
 
     def ensure_authenticated(self) -> None:
         assert self.page is not None

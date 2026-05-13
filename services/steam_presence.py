@@ -166,6 +166,8 @@ class SteamPresenceService:
                     continue
                 if self._is_ready_signal(line):
                     self.ready_event.set()
+                if self._should_suppress_output(line):
+                    continue
                 if self._is_permanent_config_error(line):
                     self.permanent_failure_detected.set()
                 self.logger.log(level, "[steam-presence/%s] %s", stream_name, line)
@@ -201,6 +203,10 @@ class SteamPresenceService:
     def _is_ready_signal(self, line: str) -> bool:
         normalized = line.lower()
         return "refresh token guardado" in normalized or "conectado" in normalized
+
+    def _should_suppress_output(self, line: str) -> bool:
+        normalized = line.lower()
+        return normalized == "conectado" or normalized.startswith("conectado |")
 
     def _is_steam_guard_prompt(self, line: str) -> bool:
         return line.startswith("STEAM_GUARD_CODE_REQUIRED:")

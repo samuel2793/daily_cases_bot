@@ -42,8 +42,16 @@ DAILY_CASE_AVATAR_CHECK_BUTTON_TEXT_XPATH = (
 )
 LOGIN_PATTERN = re.compile(r"(iniciar sesi[oó]n|login|sign in)", re.IGNORECASE)
 READY_TO_OPEN_PATTERN = re.compile(r"(abrir|open)", re.IGNORECASE)
+COOLDOWN_PATTERN = re.compile(
+    r"(tiempo restante|remaining time|\b\d{1,2}\s*:\s*\d{2}\s*:\s*\d{2}\b)",
+    re.IGNORECASE,
+)
+ZERO_COOLDOWN_PATTERN = re.compile(r"\b0{1,2}\s*:\s*0{2}\s*:\s*0{2}\b")
 STEAM_REQUIREMENT_PATTERN = re.compile(r"(steam|avatar|perfil|profile|photo|foto)", re.IGNORECASE)
-AVATAR_RECHECK_PATTERN = re.compile(r"(comprobar|check again|retry|revisar)", re.IGNORECASE)
+AVATAR_RECHECK_PATTERN = re.compile(
+    r"(comprobar|check again|retry|revisar|verific|verify)",
+    re.IGNORECASE,
+)
 AVATAR_VALID_PATTERN = re.compile(r"(avatar es v[aá]lido|avatar is valid|v[aá]lido|valid)", re.IGNORECASE)
 AVATAR_INVALID_PATTERN = re.compile(
     r"(tu avatar es incorrecto|avatar incorrecto|your avatar is incorrect|invalid avatar)",
@@ -149,14 +157,17 @@ class KeyDropSite:
     browser: Browser | None = field(default=None, init=False)
     context: BrowserContext | None = field(default=None, init=False)
     page: Page | None = field(default=None, init=False)
+    playwright: Playwright | None = field(default=None, init=False)
 
-    def run(self) -> None:
+    def run(self) -> str:
         with sync_playwright() as playwright:
+            self.playwright = playwright
             self._open_browser(playwright)
 
             try:
                 while True:
                     steam_manager: SteamAvatarManager | None = None
+                    balance_text: str | None = None
                     try:
                         self.open_home_page()
                         self.dismiss_cookie_banner()
@@ -167,18 +178,25 @@ class KeyDropSite:
                         self.persist_balance(balance_text, balance_value)
                         self.open_daily_case_overview()
                         self.open_first_daily_case_level()
+                        initial_button_text = self.inspect_stable_daily_case_open_button()
+                        if initial_button_text and self.is_cooldown_active(initial_button_text):
+                            self.logger.info(
+                                "Daily case de KeyDrop en cooldown. Saldo detectado: %s | Estado: %s",
+                                balance_text,
+                                initial_button_text,
+                            )
+                            return "cooldown"
                         steam_manager = self.prepare_daily_case_avatar_requirement()
                         button_text = self.ensure_daily_case_ready_to_open()
                         self.click_daily_case_open_button()
                         self.human_delay(2.0, 4.0)
 
-                        save_session(self.context, self.session_file, self.logger)
                         self.logger.info(
                             "Flujo de KeyDrop finalizado. Saldo detectado: %s | Boton daily case: %s",
                             balance_text,
                             button_text or "no detectado",
                         )
-                        return
+                        return "opened"
                     except KeyboardInterrupt:
                         raise
                     except Exception:
@@ -188,11 +206,12 @@ class KeyDropSite:
                         if self.context is not None:
                             save_session(self.context, self.session_file, self.logger)
                         if not self.prompt_retry():
-                            return
+                            return "aborted"
                     finally:
                         self.cleanup_steam_avatar_requirement(steam_manager)
             finally:
                 self.close()
+                self.playwright = None
 
     def _open_browser(self, playwright: Playwright) -> None:
         session_data = load_session(self.session_file, self.logger)
@@ -425,7 +444,7 @@ class KeyDropSite:
             self.logger.warning("No se encontro el boton de apertura de la daily case.")
             return None
 
-        button_text = text_locator.inner_text(timeout=5_000).strip()
+        button_text = self.compact_text(text_locator.inner_text(timeout=5_000))
         if not button_text:
             self.logger.warning("El boton de apertura existe pero su texto esta vacio.")
             return ""
@@ -434,6 +453,26 @@ class KeyDropSite:
             "Boton de apertura de daily case detectado con texto: %s",
             button_text,
         )
+        return button_text
+
+    def inspect_stable_daily_case_open_button(self, attempts: int = 4) -> str | None:
+        button_text: str | None = None
+
+        for attempt in range(1, attempts + 1):
+            button_text = self.inspect_daily_case_open_button()
+            if not button_text:
+                return button_text
+            if not self.is_zero_cooldown_placeholder(button_text):
+                return button_text
+
+            if attempt < attempts:
+                self.logger.info(
+                    "El boton de KeyDrop aun muestra 00:00:00. Esperando estabilizacion (%s/%s).",
+                    attempt,
+                    attempts,
+                )
+                self.human_delay(1.0, 1.6)
+
         return button_text
 
     def prepare_daily_case_avatar_requirement(self) -> SteamAvatarManager | None:
@@ -449,11 +488,10 @@ class KeyDropSite:
             return None
 
         if not AVATAR_RECHECK_PATTERN.search(avatar_check_text):
-            self.logger.info(
-                "El boton de comprobacion de avatar no requiere accion adicional: %s",
-                avatar_check_text,
+            raise RuntimeError(
+                "Estado de comprobacion de avatar no reconocido en KeyDrop: "
+                f"{avatar_check_text}"
             )
-            return None
 
         steam_manager = self.apply_steam_avatar_requirement()
         self.click_avatar_check_button()
@@ -461,7 +499,9 @@ class KeyDropSite:
         return steam_manager
 
     def ensure_daily_case_ready_to_open(self) -> str:
-        button_text = self.inspect_daily_case_open_button()
+        button_text = self.inspect_stable_daily_case_open_button()
+        if button_text and self.is_cooldown_active(button_text):
+            raise RuntimeError(f"La daily case esta en cooldown: {button_text}")
         if button_text and self.is_ready_to_open(button_text):
             return button_text
 
@@ -474,6 +514,8 @@ class KeyDropSite:
             raise FileNotFoundError(
                 f"No existe la imagen de avatar para Steam: {self.steam_avatar_file}"
             )
+        if self.playwright is None:
+            raise RuntimeError("No hay instancia activa de Playwright en KeyDrop.")
 
         steam_logger = logging.getLogger("daily_cases_bot.steam")
         steam_manager = SteamAvatarManager(
@@ -483,7 +525,7 @@ class KeyDropSite:
         )
 
         try:
-            steam_manager.start()
+            steam_manager.start(playwright=self.playwright)
             steam_manager.backup_and_apply_from_file(self.steam_avatar_file)
             self.logger.info("Avatar temporal de Steam aplicado para desbloquear la daily case.")
             self.human_delay(2.0, 4.0)
@@ -525,7 +567,7 @@ class KeyDropSite:
         except PlaywrightTimeoutError:
             return None
 
-        button_text = text_locator.inner_text(timeout=5_000).strip()
+        button_text = self.compact_text(text_locator.inner_text(timeout=5_000))
         self.logger.info("Boton de comprobacion de avatar detectado con texto: %s", button_text)
         return button_text
 
@@ -572,9 +614,20 @@ class KeyDropSite:
         return True
 
     def is_ready_to_open(self, button_text: str) -> bool:
+        if self.is_cooldown_active(button_text):
+            return False
         if STEAM_REQUIREMENT_PATTERN.search(button_text):
             return False
         return bool(READY_TO_OPEN_PATTERN.search(button_text))
+
+    def is_cooldown_active(self, button_text: str) -> bool:
+        return bool(COOLDOWN_PATTERN.search(button_text))
+
+    def is_zero_cooldown_placeholder(self, button_text: str) -> bool:
+        return bool(COOLDOWN_PATTERN.search(button_text) and ZERO_COOLDOWN_PATTERN.search(button_text))
+
+    def compact_text(self, value: str) -> str:
+        return " ".join(value.split()).strip()
 
     def safe_click(
         self,

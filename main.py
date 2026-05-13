@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from services import SteamPresenceService
+from sites.csgocases import CSGOCasesSite
 from sites.keydrop import KeyDropSite
 from sites.steam_playtime import SteamPlaytimeMonitor, format_hours_and_minutes
 
@@ -46,11 +47,13 @@ def configure_logging() -> logging.Logger:
 def main() -> None:
     ensure_runtime_dirs()
     logger = configure_logging()
+    csgocases_session_file = SESSIONS_DIR / "csgocases_session.json"
     session_file = SESSIONS_DIR / "session.json"
     steam_session_file = SESSIONS_DIR / "steam_session.json"
     balances_file = DATA_DIR / "balances.json"
     steam_playtime_file = DATA_DIR / "steam_playtime.json"
-    steam_avatar_file = BASE_DIR / "images" / "keydrop.webp"
+    keydrop_steam_avatar_file = BASE_DIR / "images" / "keydrop.webp"
+    csgocases_steam_avatar_file = BASE_DIR / "images" / "csgocases.png"
     steam_presence_script = BASE_DIR / "cs2.js"
 
     logger.info("Comprobando requisito previo de horas recientes en Steam.")
@@ -69,19 +72,15 @@ def main() -> None:
     site = KeyDropSite(
         session_file=session_file,
         steam_session_file=steam_session_file,
-        steam_avatar_file=steam_avatar_file,
+        steam_avatar_file=keydrop_steam_avatar_file,
         steam_workspace_dir=DATA_DIR,
         balances_file=balances_file,
         logger=logging.getLogger("daily_cases_bot.keydrop"),
     )
+    keydrop_result = "not_started"
+    csgocases_result = "not_started"
 
     try:
-        steam_presence.start()
-        if not steam_presence.wait_until_ready():
-            logger.warning(
-                "Steam Presence no quedo listo. Revisa el login/2FA y vuelve a ejecutar."
-            )
-            return
         recent_hours = playtime_monitor.check_recent_hours_once()
         if recent_hours < playtime_monitor.minimum_hours:
             logger.warning(
@@ -91,14 +90,43 @@ def main() -> None:
                 format_hours_and_minutes(playtime_monitor.minimum_hours),
             )
             return
-        site.run()
+        steam_presence.start()
+        if not steam_presence.wait_until_ready():
+            logger.warning(
+                "Steam Presence no quedo listo. Revisa el login/2FA y vuelve a ejecutar."
+            )
+            return
+
+        keydrop_result = site.run()
+        logger.info("KeyDrop finalizo con estado: %s", keydrop_result)
+        logger.info("Inicializando bot para CSGOCases.")
+        csgocases_site = CSGOCasesSite(
+            session_file=csgocases_session_file,
+            steam_session_file=steam_session_file,
+            steam_avatar_file=csgocases_steam_avatar_file,
+            steam_workspace_dir=DATA_DIR,
+            balances_file=balances_file,
+            logger=logging.getLogger("daily_cases_bot.csgocases"),
+        )
+        csgocases_result = csgocases_site.run()
     except KeyboardInterrupt:
         logger.info("Ejecucion interrumpida por el usuario.")
     except Exception:
         logger.exception("Error no controlado en main.")
-        input("El proceso sigue vivo. Pulsa Enter para cerrar.")
+        try:
+            input("El proceso sigue vivo. Pulsa Enter para cerrar.")
+        except KeyboardInterrupt:
+            logger.info("Cierre forzado por el usuario.")
     finally:
         steam_presence.stop()
+        logger.info(
+            "Resumen final | Steam: %s | KeyDrop: %s | CSGOCases: %s",
+            format_hours_and_minutes(recent_hours)
+            if "recent_hours" in locals()
+            else "sin comprobar",
+            keydrop_result,
+            csgocases_result,
+        )
 
 
 if __name__ == "__main__":
