@@ -37,6 +37,29 @@ CLAIM_BUTTON_TEXT_XPATH = (
 )
 LOGIN_PATTERN = re.compile(r"(iniciar sesi[oó]n|login|sign in|steam)", re.IGNORECASE)
 CLAIM_PATTERN = re.compile(r"\bclaim\b", re.IGNORECASE)
+SELL_PATTERN = re.compile(r"(vender|sell)", re.IGNORECASE)
+WEAPON_REWARD_PATTERN = re.compile(
+    r"\b("
+    r"ak-47|m4a1-s|m4a4|awp|usp-s|glock-18|deagle|desert eagle|p250|famas|galil|galil ar|"
+    r"mp9|mp7|mp5-sd|ump-45|p90|aug|sg 553|xm1014|mag-7|nova|sawed-off|mac-10|"
+    r"five-seven|cz75|tec-9|dual berettas|ssg 08|negev|m249|knife|karambit|bayonet|"
+    r"butterfly|falchion|shadow daggers|huntsman|ursus|talon|stiletto|navaja|"
+    r"gloves|guantes"
+    r")\b",
+    re.IGNORECASE,
+)
+GENERIC_UI_TEXT_PATTERN = re.compile(
+    r"(bloodycase|daily free|claim|sell|vender|free|daily|reward|recompensa|"
+    r"saldo|balance|steam|avatar|nick|profile|abrir|open|case|caja|upgrade|"
+    r"battle|contracts|upgrade|withdraw|retirar|login|sign in)",
+    re.IGNORECASE,
+)
+PRE_CLAIM_BODY_PATTERN = re.compile(
+    r"(ready\s*[·-]?\s*click your case above to claim|"
+    r"complete all requirements to claim your daily free bonus|"
+    r"gratis cs2 skins|how it works)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -80,9 +103,21 @@ class BloodyCaseSite:
 
                         if not button_text:
                             self.capture_post_claim_diagnostics(
-                                balance_text=balance_text,
+                                balance_text_before=balance_text,
+                                balance_value_before=balance_value,
+                                balance_text_after=None,
+                                balance_value_after=None,
                                 claim_button_text=None,
                                 status="button_not_found",
+                                reward_text=None,
+                                reward_kind="unknown",
+                                reward_candidates=[],
+                                visible_buttons_before_sell=[],
+                                visible_buttons_after_sell=[],
+                                sell_button_text=None,
+                                sell_offer_value=None,
+                                sell_clicked=False,
+                                gain_value=None,
                             )
                             self.logger.warning(
                                 "No se encontro el boton CLAIM de BloodyCase. Saldo detectado: %s",
@@ -92,9 +127,21 @@ class BloodyCaseSite:
 
                         if not CLAIM_PATTERN.search(button_text):
                             self.capture_post_claim_diagnostics(
-                                balance_text=balance_text,
+                                balance_text_before=balance_text,
+                                balance_value_before=balance_value,
+                                balance_text_after=None,
+                                balance_value_after=None,
                                 claim_button_text=button_text,
                                 status="not_claimable",
+                                reward_text=None,
+                                reward_kind="unknown",
+                                reward_candidates=[],
+                                visible_buttons_before_sell=[],
+                                visible_buttons_after_sell=[],
+                                sell_button_text=None,
+                                sell_offer_value=None,
+                                sell_clicked=False,
+                                gain_value=None,
                             )
                             self.logger.info(
                                 "BloodyCase no esta en estado CLAIM. Saldo detectado: %s | Estado: %s",
@@ -107,19 +154,20 @@ class BloodyCaseSite:
                         self.reload_daily_free_page_after_steam_changes()
                         button_text = self.inspect_claim_button_text() or button_text
                         self.click_claim_button()
-                        self.human_delay(6.0, 9.0)
-                        self.capture_post_claim_diagnostics(
-                            balance_text=balance_text,
+                        post_claim_status = self.handle_post_claim_state(
+                            balance_text_before=balance_text,
+                            balance_value_before=balance_value,
                             claim_button_text=button_text,
-                            status="claim_clicked",
                         )
                         self.logger.info(
-                            "Flujo de BloodyCase finalizado. Saldo detectado: %s | Boton inicial: %s",
+                            "Flujo de BloodyCase finalizado. Saldo detectado: %s | Boton inicial: %s | Estado postapertura: %s",
                             balance_text,
                             button_text,
+                            post_claim_status,
                         )
-                        return "claim_clicked"
+                        return post_claim_status
                     except KeyboardInterrupt:
+                        self.abort_pending_page_activity()
                         raise
                     except Exception:
                         self.logger.exception(
@@ -193,7 +241,12 @@ class BloodyCaseSite:
     def wait_for_page_ready(self) -> None:
         assert self.page is not None
 
-        self.page.wait_for_load_state("domcontentloaded")
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=12_000)
+        except PlaywrightTimeoutError:
+            self.logger.info(
+                "La pagina de BloodyCase no entro en domcontentloaded. Se continua con timeout controlado."
+            )
         try:
             self.page.wait_for_load_state("networkidle", timeout=10_000)
         except PlaywrightTimeoutError:
@@ -202,6 +255,15 @@ class BloodyCaseSite:
             )
 
         self.page.locator("body").wait_for(state="visible", timeout=10_000)
+
+    def abort_pending_page_activity(self) -> None:
+        if self.page is None:
+            return
+
+        try:
+            self.page.evaluate("window.stop()")
+        except Exception:
+            pass
 
     def ensure_authenticated(self) -> None:
         assert self.page is not None
@@ -361,9 +423,22 @@ class BloodyCaseSite:
 
     def capture_post_claim_diagnostics(
         self,
-        balance_text: str,
+        *,
+        balance_text_before: str,
+        balance_value_before: float | None,
+        balance_text_after: str | None,
+        balance_value_after: float | None,
         claim_button_text: str | None,
         status: str,
+        reward_text: str | None,
+        reward_kind: str,
+        reward_candidates: list[dict[str, Any]],
+        visible_buttons_before_sell: list[str],
+        visible_buttons_after_sell: list[str],
+        sell_button_text: str | None,
+        sell_offer_value: float | None,
+        sell_clicked: bool,
+        gain_value: float | None,
     ) -> None:
         assert self.page is not None
 
@@ -381,8 +456,20 @@ class BloodyCaseSite:
                 "captured_at": datetime.now().astimezone().isoformat(),
                 "url": self.page.url,
                 "status": status,
-                "balance_text": balance_text,
+                "balance_text_before": balance_text_before,
+                "balance_value_before": balance_value_before,
+                "balance_text_after": balance_text_after,
+                "balance_value_after": balance_value_after,
                 "claim_button_text": claim_button_text,
+                "reward_text": reward_text,
+                "reward_kind": reward_kind,
+                "reward_candidates": reward_candidates[:25],
+                "visible_buttons_before_sell": visible_buttons_before_sell,
+                "visible_buttons_after_sell": visible_buttons_after_sell,
+                "sell_button_text": sell_button_text,
+                "sell_offer_value": sell_offer_value,
+                "sell_clicked": sell_clicked,
+                "gain_value": gain_value,
             }
             json_file.write_text(
                 json.dumps(snapshot, indent=2, ensure_ascii=False),
@@ -396,6 +483,156 @@ class BloodyCaseSite:
             )
         except Exception:
             self.logger.exception("No se pudo capturar el diagnostico de BloodyCase.")
+
+    def handle_post_claim_state(
+        self,
+        balance_text_before: str,
+        balance_value_before: float | None,
+        claim_button_text: str | None,
+    ) -> str:
+        assert self.page is not None
+
+        self.logger.info(
+            "Esperando el estado posterior a la apertura de la caja de BloodyCase."
+        )
+        reward_candidates: list[dict[str, Any]] = []
+        reward_text: str | None = None
+        reward_kind = "unknown"
+        visible_buttons_before_sell: list[str] = []
+
+        started_at = time.monotonic()
+        self.human_delay(12.0, 15.0)
+        while True:
+            reward_candidates = self.collect_visible_text_candidates()
+            reward_text = self.infer_reward_text(reward_candidates)
+            reward_kind = self.infer_reward_kind(reward_text)
+            visible_buttons_before_sell = self.collect_visible_button_texts()
+            body_text = self.try_read_body_text()
+            sell_button_text_probe = self.find_sell_button_text()
+
+            if not self.should_keep_waiting_for_reward(
+                reward_text=reward_text,
+                reward_kind=reward_kind,
+                body_text=body_text,
+                sell_button_text=sell_button_text_probe,
+                elapsed_seconds=time.monotonic() - started_at,
+            ):
+                break
+
+            self.logger.info(
+                "BloodyCase sigue mostrando una vista previa/no concluyente tras el CLAIM. Se espera un poco mas antes de registrar la salida."
+            )
+            self.human_delay(3.0, 4.5)
+
+        if reward_text:
+            self.logger.info(
+                "Recompensa candidata detectada en BloodyCase: %s | Tipo: %s",
+                reward_text,
+                reward_kind,
+            )
+        else:
+            self.logger.warning(
+                "No se pudo inferir con claridad la recompensa de BloodyCase."
+            )
+
+        if visible_buttons_before_sell:
+            self.logger.info(
+                "Botones visibles tras abrir la caja de BloodyCase: %s",
+                visible_buttons_before_sell,
+            )
+        else:
+            self.logger.warning(
+                "No se detectaron botones visibles tras abrir la caja de BloodyCase."
+            )
+
+        sell_button_text = self.find_sell_button_text()
+        sell_offer_value = self.parse_balance_value(sell_button_text) if sell_button_text else None
+        sell_clicked = False
+        balance_text_after = None
+        balance_value_after = None
+        gain_value = None
+        visible_buttons_after_sell = visible_buttons_before_sell
+
+        if reward_kind == "skin" and sell_button_text:
+            self.logger.info(
+                "Boton de venta detectado tras abrir la caja de BloodyCase: %s",
+                sell_button_text,
+            )
+            sell_clicked = self.click_sell_button()
+            if sell_clicked:
+                self.human_delay(3.0, 5.0)
+                balance_text_after = self.try_read_balance_text()
+                balance_value_after = (
+                    self.parse_balance_value(balance_text_after) if balance_text_after else None
+                )
+                if balance_text_after and balance_value_after is not None:
+                    self.persist_balance(balance_text_after, balance_value_after)
+                if (
+                    balance_value_before is not None
+                    and balance_value_after is not None
+                ):
+                    gain_value = round(balance_value_after - balance_value_before, 2)
+                    self.logger.info(
+                        "Ganancia estimada por la venta en BloodyCase: %s",
+                        gain_value,
+                    )
+                visible_buttons_after_sell = self.collect_visible_button_texts()
+        elif reward_kind != "skin" and sell_button_text:
+            self.logger.info(
+                "Se ha detectado un boton de venta, pero la recompensa parece %s. No se intenta vender.",
+                reward_kind,
+            )
+
+        status = "claim_sold" if sell_clicked else "claim_unsold"
+        self.capture_post_claim_diagnostics(
+            balance_text_before=balance_text_before,
+            balance_value_before=balance_value_before,
+            balance_text_after=balance_text_after,
+            balance_value_after=balance_value_after,
+            claim_button_text=claim_button_text,
+            status=status,
+            reward_text=reward_text,
+            reward_kind=reward_kind,
+            reward_candidates=reward_candidates,
+            visible_buttons_before_sell=visible_buttons_before_sell,
+            visible_buttons_after_sell=visible_buttons_after_sell,
+            sell_button_text=sell_button_text,
+            sell_offer_value=sell_offer_value,
+            sell_clicked=sell_clicked,
+            gain_value=gain_value,
+        )
+        return status
+
+    def should_keep_waiting_for_reward(
+        self,
+        *,
+        reward_text: str | None,
+        reward_kind: str,
+        body_text: str | None,
+        sell_button_text: str | None,
+        elapsed_seconds: float,
+    ) -> bool:
+        if elapsed_seconds >= 30:
+            return False
+
+        if reward_kind == "skin":
+            return False
+        if sell_button_text:
+            return False
+        if reward_text and not self.is_generic_reward_text(reward_text):
+            return False
+        if body_text and PRE_CLAIM_BODY_PATTERN.search(body_text):
+            return True
+        return elapsed_seconds < 18
+
+    def try_read_body_text(self) -> str | None:
+        assert self.page is not None
+
+        try:
+            body_text = self.page.locator("body").inner_text(timeout=5_000)
+        except Exception:
+            return None
+        return self.compact_text(body_text)
 
     def apply_steam_requirements(self) -> SteamAvatarManager:
         if not self.steam_avatar_file.exists():
@@ -460,6 +697,180 @@ class BloodyCaseSite:
             logger=logging.getLogger("daily_cases_bot.steam"),
         )
 
+    def try_read_balance_text(self) -> str | None:
+        try:
+            return self.read_balance_text()
+        except Exception:
+            self.logger.warning("No se pudo releer el saldo de BloodyCase tras la apertura.")
+            return None
+
+    def find_sell_button_locator(self) -> Locator | None:
+        assert self.page is not None
+
+        sell_locators = [
+            self.page.get_by_role("button", name=SELL_PATTERN).first,
+            self.page.get_by_role("link", name=SELL_PATTERN).first,
+            self.page.locator("button").filter(has_text=SELL_PATTERN).first,
+            self.page.locator("a").filter(has_text=SELL_PATTERN).first,
+            self.page.locator("[role='button']").filter(has_text=SELL_PATTERN).first,
+        ]
+        return self.first_visible(sell_locators, timeout_ms=4_000)
+
+    def find_sell_button_text(self) -> str | None:
+        locator = self.find_sell_button_locator()
+        if locator is None:
+            return None
+        try:
+            return self.compact_text(locator.inner_text(timeout=2_000))
+        except Exception:
+            return "boton de venta detectado sin texto legible"
+
+    def click_sell_button(self) -> bool:
+        locator = self.find_sell_button_locator()
+        if locator is None:
+            return False
+        return self.safe_click(locator, "boton de vender recompensa en BloodyCase", allow_fail=True)
+
+    def collect_visible_button_texts(self) -> list[str]:
+        assert self.page is not None
+
+        try:
+            raw_buttons = self.page.evaluate(
+                """
+                () => {
+                  const isVisible = (el) => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style &&
+                      style.visibility !== 'hidden' &&
+                      style.display !== 'none' &&
+                      rect.width > 0 &&
+                      rect.height > 0;
+                  };
+
+                  const nodes = Array.from(
+                    document.querySelectorAll("button, a, [role='button']")
+                  );
+                  return nodes
+                    .filter(isVisible)
+                    .map((el) => (el.innerText || el.textContent || "").trim())
+                    .filter((text) => text.length > 0)
+                    .slice(0, 40);
+                }
+                """
+            )
+        except Exception:
+            self.logger.warning("No se pudieron recolectar los botones visibles de BloodyCase.")
+            return []
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in raw_buttons or []:
+            text = self.compact_text(str(item))
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+        return normalized
+
+    def collect_visible_text_candidates(self) -> list[dict[str, Any]]:
+        assert self.page is not None
+
+        try:
+            raw_candidates = self.page.evaluate(
+                """
+                () => {
+                  const isVisible = (el) => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style &&
+                      style.visibility !== 'hidden' &&
+                      style.display !== 'none' &&
+                      rect.width > 0 &&
+                      rect.height > 0;
+                  };
+
+                  const nodes = Array.from(
+                    document.querySelectorAll("h1, h2, h3, h4, p, span, div, strong, b")
+                  );
+
+                  return nodes
+                    .filter(isVisible)
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      const style = window.getComputedStyle(el);
+                      return {
+                        text: (el.innerText || el.textContent || "").trim(),
+                        tag: el.tagName.toLowerCase(),
+                        className: typeof el.className === "string" ? el.className : "",
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                        fontSize: parseFloat(style.fontSize || "0"),
+                        fontWeight: String(style.fontWeight || ""),
+                      };
+                    })
+                    .filter((item) => item.text.length > 1)
+                    .slice(0, 200);
+                }
+                """
+            )
+        except Exception:
+            self.logger.warning("No se pudieron recolectar los textos visibles de BloodyCase.")
+            return []
+
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in raw_candidates or []:
+            text = self.compact_text(str(item.get("text", "")))
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            candidate = dict(item)
+            candidate["text"] = text
+            candidates.append(candidate)
+        return candidates
+
+    def infer_reward_text(self, candidates: list[dict[str, Any]]) -> str | None:
+        filtered: list[dict[str, Any]] = []
+        for candidate in candidates:
+            text = str(candidate.get("text", "")).strip()
+            if not text:
+                continue
+            if len(text) > 100:
+                continue
+            if GENERIC_UI_TEXT_PATTERN.search(text):
+                continue
+            if self.is_generic_reward_text(text):
+                continue
+            if re.fullmatch(r"[\d\s.,:$€£-]+", text):
+                continue
+            filtered.append(candidate)
+
+        if not filtered:
+            return None
+
+        filtered.sort(
+            key=lambda item: (
+                float(item.get("fontSize", 0) or 0),
+                float(item.get("width", 0) or 0) * float(item.get("height", 0) or 0),
+            ),
+            reverse=True,
+        )
+        return str(filtered[0].get("text", "")).strip() or None
+
+    def infer_reward_kind(self, reward_text: str | None) -> str:
+        if not reward_text:
+            return "unknown"
+        if WEAPON_REWARD_PATTERN.search(reward_text):
+            return "skin"
+        return "unknown"
+
+    def is_generic_reward_text(self, text: str) -> bool:
+        compact = self.compact_text(text)
+        return bool(PRE_CLAIM_BODY_PATTERN.search(compact))
+
     def compact_text(self, value: str) -> str:
         return " ".join(value.split()).strip()
 
@@ -521,6 +932,7 @@ class BloodyCaseSite:
 
     def close(self) -> None:
         if self.context is not None:
+            self.abort_pending_page_activity()
             page_closed = False
             if self.page is not None:
                 try:

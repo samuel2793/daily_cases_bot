@@ -1,17 +1,30 @@
 from __future__ import annotations
 
+import json
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
+
+from .keydrop import load_session, save_balance_snapshot
 from .steam import SteamAvatarManager
 
 DEFAULT_URL = "https://csgocases.com/es"
 DAILY_FREE_CASE_URL_ES = "https://csgocases.com/es/case/caja-gratis-2"
 FREE_NICK_CASE_URL_ES = "https://csgocases.com/es/case/caja-gratis"
 STEAM_NICK_SUFFIX = "CS2SKINS.GIFT"
+CURRENCY_PATTERN = re.compile(r"(?:\$|€)\s*\d+(?:[.,]\d{1,2})?")
 
 
 class ManualFlowAborted(RuntimeError):
@@ -41,12 +54,22 @@ class CSGOCasesSite:
             )
             self.cleanup_steam_avatar_requirement(avatar_manager)
             avatar_manager = None
+            self.capture_balance_after_manual_case(
+                case_label="Caja gratis 2 de CSGOCases",
+                source_url=DAILY_FREE_CASE_URL_ES,
+            )
 
             nickname_manager = self.apply_steam_profile_name_requirement()
             self.wait_for_manual_case_completion(
                 case_label="Caja gratis de CSGOCases",
                 target_url=FREE_NICK_CASE_URL_ES,
                 requirement_label=f"nick de Steam con '{STEAM_NICK_SUFFIX}'",
+            )
+            self.cleanup_steam_profile_name_requirement(nickname_manager)
+            nickname_manager = None
+            self.capture_balance_after_manual_case(
+                case_label="Caja gratis de CSGOCases",
+                source_url=FREE_NICK_CASE_URL_ES,
             )
 
             self.logger.info(
@@ -175,6 +198,282 @@ class CSGOCasesSite:
             workspace_dir=self.steam_workspace_dir,
             logger=logging.getLogger("daily_cases_bot.steam"),
         )
+
+    def capture_balance_after_manual_case(self, case_label: str, source_url: str) -> None:
+        previous_balance_text, previous_balance_value = self.get_latest_known_balance()
+        current_balance_text, current_balance_value = self.try_read_balance_with_browser()
+
+        if current_balance_text is None:
+            current_balance_text = self.prompt_manual_balance(case_label)
+            current_balance_value = (
+                self.parse_balance_value(current_balance_text) if current_balance_text else None
+            )
+
+        if not current_balance_text:
+            self.logger.warning(
+                "No se pudo registrar el saldo posterior a %s en CSGOCases.",
+                case_label,
+            )
+            return
+
+        saved = save_balance_snapshot(
+            balances_file=self.balances_file,
+            site_name="csgocases",
+            balance_text=current_balance_text,
+            balance_value=current_balance_value,
+            source_url=source_url,
+            logger=self.logger,
+        )
+        if not saved:
+            self.logger.warning(
+                "No se pudo guardar el saldo posterior a %s en CSGOCases.",
+                case_label,
+            )
+            return
+
+        self.log_balance_change(
+            case_label=case_label,
+            previous_balance_text=previous_balance_text,
+            previous_balance_value=previous_balance_value,
+            current_balance_text=current_balance_text,
+            current_balance_value=current_balance_value,
+        )
+
+    def get_latest_known_balance(self) -> tuple[str | None, float | None]:
+        if not self.balances_file.exists():
+            return None, None
+
+        try:
+            store = json.loads(self.balances_file.read_text(encoding="utf-8"))
+        except Exception:
+            self.logger.warning(
+                "No se pudo leer el historial de saldos para CSGOCases desde %s.",
+                self.balances_file,
+            )
+            return None, None
+
+        latest = store.get("csgocases", {}).get("latest")
+        if not latest:
+            return None, None
+        return latest.get("balance_text"), latest.get("balance_value")
+
+    def try_read_balance_with_browser(self) -> tuple[str | None, float | None]:
+        session_data = load_session(self.session_file, self.logger)
+        browser: Browser | None = None
+        context: BrowserContext | None = None
+        page: Page | None = None
+
+        try:
+            with sync_playwright() as playwright:
+                browser, context, page = self.open_balance_check_browser(
+                    playwright,
+                    session_data,
+                )
+                self.logger.info(
+                    "Revisando automaticamente el saldo de CSGOCases tras la apertura manual."
+                )
+                page.goto(self.url, wait_until="domcontentloaded", timeout=25_000)
+                self.wait_for_light_page_ready(page)
+                balance_text = self.find_balance_text(page)
+                if not balance_text:
+                    self.logger.warning(
+                        "No se pudo localizar automaticamente el saldo de CSGOCases tras la apertura manual."
+                    )
+                    return None, None
+
+                self.logger.info(
+                    "Saldo posterior detectado automaticamente en CSGOCases: %s",
+                    balance_text,
+                )
+                return balance_text, self.parse_balance_value(balance_text)
+        except Exception:
+            self.logger.warning(
+                "La revision automatica del saldo de CSGOCases fallo tras la apertura manual.",
+                exc_info=True,
+            )
+            return None, None
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+    def open_balance_check_browser(
+        self,
+        playwright: Playwright,
+        session_data: dict | None,
+    ) -> tuple[Browser, BrowserContext, Page]:
+        browser = playwright.chromium.launch(
+            headless=False,
+            slow_mo=60,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--start-maximized",
+            ],
+        )
+
+        context_kwargs = {
+            "viewport": {"width": 1440, "height": 920},
+            "locale": "es-ES",
+            "timezone_id": "Europe/Madrid",
+            "color_scheme": "light",
+            "user_agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "extra_http_headers": {
+                "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+            },
+        }
+        if session_data:
+            context_kwargs["storage_state"] = session_data
+
+        context = browser.new_context(**context_kwargs)
+        context.set_default_timeout(12_000)
+        context.set_default_navigation_timeout(25_000)
+        context.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'platform', { get: () => 'Linux x86_64' });
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['es-ES', 'es', 'en-US', 'en']
+            });
+            """
+        )
+        page = context.new_page()
+        page.bring_to_front()
+        return browser, context, page
+
+    def wait_for_light_page_ready(self, page: Page) -> None:
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10_000)
+        except PlaywrightTimeoutError:
+            self.logger.info(
+                "CSGOCases no entro en domcontentloaded durante la revision de saldo. Se continua."
+            )
+        try:
+            page.wait_for_load_state("networkidle", timeout=8_000)
+        except PlaywrightTimeoutError:
+            self.logger.info(
+                "CSGOCases no entro en networkidle durante la revision de saldo. Se continua."
+            )
+
+    def find_balance_text(self, page: Page) -> str | None:
+        try:
+            balance_text = page.evaluate(
+                """
+                (patternSource) => {
+                  const pattern = new RegExp(patternSource);
+                  const isVisible = (el) => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style &&
+                      style.visibility !== 'hidden' &&
+                      style.display !== 'none' &&
+                      rect.width > 0 &&
+                      rect.height > 0;
+                  };
+
+                  const roots = Array.from(
+                    document.querySelectorAll("header, [class*='header'], [id*='header']")
+                  );
+                  const candidates = [];
+
+                  for (const root of roots) {
+                    const nodes = [root, ...root.querySelectorAll("*")];
+                    for (const node of nodes) {
+                      if (!isVisible(node)) continue;
+                      const text = (node.innerText || node.textContent || "").trim();
+                      if (!text) continue;
+                      const match = text.match(pattern);
+                      if (!match) continue;
+                      const rect = node.getBoundingClientRect();
+                      candidates.push({ text: match[0], y: rect.y, x: rect.x });
+                    }
+                  }
+
+                  candidates.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+                  return candidates.length ? candidates[0].text : null;
+                }
+                """,
+                CURRENCY_PATTERN.pattern,
+            )
+        except Exception:
+            return None
+
+        if not balance_text:
+            return None
+        return self.compact_text(str(balance_text))
+
+    def prompt_manual_balance(self, case_label: str) -> str | None:
+        answer = input(
+            f"No se pudo leer automaticamente el saldo de CSGOCases tras '{case_label}'. "
+            "Si quieres registrarlo, pega aqui el saldo actual mostrado en la web (por ejemplo $1.19) o pulsa Enter para omitir: "
+        ).strip()
+        return answer or None
+
+    def parse_balance_value(self, balance_text: str) -> float | None:
+        cleaned = re.sub(r"[^\d,.\-]", "", balance_text).strip()
+        if not cleaned:
+            return None
+
+        if "," in cleaned and "." in cleaned:
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        elif "," in cleaned:
+            cleaned = cleaned.replace(",", ".")
+
+        try:
+            return float(cleaned)
+        except ValueError:
+            self.logger.warning(
+                "No se pudo convertir el saldo de CSGOCases '%s' a numero.",
+                balance_text,
+            )
+            return None
+
+    def log_balance_change(
+        self,
+        *,
+        case_label: str,
+        previous_balance_text: str | None,
+        previous_balance_value: float | None,
+        current_balance_text: str,
+        current_balance_value: float | None,
+    ) -> None:
+        if previous_balance_value is None or current_balance_value is None:
+            self.logger.info(
+                "Saldo registrado tras %s en CSGOCases: %s",
+                case_label,
+                current_balance_text,
+            )
+            return
+
+        delta = round(current_balance_value - previous_balance_value, 2)
+        if delta == 0:
+            self.logger.info(
+                "Saldo de CSGOCases sin cambios tras %s: %s",
+                case_label,
+                current_balance_text,
+            )
+            return
+
+        self.logger.info(
+            "Cambio de saldo detectado en CSGOCases tras %s: %s -> %s (delta %s)",
+            case_label,
+            previous_balance_text or "sin saldo previo",
+            current_balance_text,
+            delta,
+        )
+
+    def compact_text(self, value: str) -> str:
+        return " ".join(value.split()).strip()
 
     def human_delay(self, min_seconds: float = 0.8, max_seconds: float = 1.8) -> None:
         time.sleep(random.uniform(min_seconds, max_seconds))

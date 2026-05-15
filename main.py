@@ -132,7 +132,10 @@ def main() -> None:
         except KeyboardInterrupt:
             logger.info("Cierre forzado por el usuario.")
     finally:
-        steam_presence.stop()
+        try:
+            steam_presence.stop()
+        except KeyboardInterrupt:
+            logger.info("Cierre interrumpido por el usuario mientras se detenia Steam Presence.")
         logger.info(
             "Resumen final | Steam: %s | KeyDrop: %s | CSGOCases: %s | BloodyCase: %s",
             format_hours_and_minutes(recent_hours)

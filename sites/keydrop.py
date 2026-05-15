@@ -386,14 +386,15 @@ class KeyDropSite:
     def reset_page_after_navigation_failure(self) -> None:
         assert self.context is not None
 
-        self.stop_page_loading()
-
-        if self.page is not None:
-            try:
-                if not self.page.is_closed():
-                    self.page.close()
-            except Exception:
-                pass
+        old_page = self.page
+        try:
+            if old_page is not None:
+                try:
+                    old_page.evaluate("window.stop()")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         self.page = self.context.new_page()
         self.page.bring_to_front()

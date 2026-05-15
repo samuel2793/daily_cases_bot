@@ -58,11 +58,22 @@ class SteamPresenceService:
                 )
                 process.kill()
                 process.wait(timeout=5)
+            except KeyboardInterrupt:
+                self.logger.info(
+                    "Interrupcion durante la espera de cierre de Steam Presence. Se continua con el cierre."
+                )
+                return
 
         self.process = None
 
         if self.supervisor_thread is not None and self.supervisor_thread.is_alive():
-            self.supervisor_thread.join(timeout=2)
+            try:
+                self.supervisor_thread.join(timeout=2)
+            except KeyboardInterrupt:
+                self.logger.info(
+                    "Interrupcion durante el cierre del supervisor de Steam Presence."
+                )
+                return
         self.supervisor_thread = None
 
     def wait_until_ready(self, timeout_seconds: float = 180.0) -> bool:
