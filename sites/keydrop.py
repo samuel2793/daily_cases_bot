@@ -14,6 +14,7 @@ from typing import Any
 from playwright.sync_api import (
     Browser,
     BrowserContext,
+    Error as PlaywrightError,
     Locator,
     Page,
     Playwright,
@@ -55,6 +56,24 @@ AVATAR_RECHECK_PATTERN = re.compile(
 AVATAR_VALID_PATTERN = re.compile(r"(avatar es v[aá]lido|avatar is valid|v[aá]lido|valid)", re.IGNORECASE)
 AVATAR_INVALID_PATTERN = re.compile(
     r"(tu avatar es incorrecto|avatar incorrecto|your avatar is incorrect|invalid avatar)",
+    re.IGNORECASE,
+)
+SELL_PATTERN = re.compile(r"(vender|sell)", re.IGNORECASE)
+COINS_PATTERN = re.compile(r"gold\s*coins?|coins?|monedas?", re.IGNORECASE)
+WEAPON_REWARD_PATTERN = re.compile(
+    r"\b("
+    r"ak-47|m4a1-s|m4a4|awp|usp-s|glock-18|deagle|desert eagle|p250|famas|galil|galil ar|"
+    r"mp9|mp7|mp5-sd|ump-45|p90|aug|sg 553|xm1014|mag-7|nova|sawed-off|mac-10|"
+    r"five-seven|cz75|tec-9|dual berettas|ssg 08|negev|m249|knife|karambit|bayonet|"
+    r"butterfly|falchion|shadow daggers|huntsman|ursus|talon|stiletto|navaja|"
+    r"gloves|guantes"
+    r")\b",
+    re.IGNORECASE,
+)
+GENERIC_UI_TEXT_PATTERN = re.compile(
+    r"(keydrop|daily case|daily|abrir|open|vender|sell|upgrade|mejorar|withdraw|retirar|"
+    r"steam|avatar|perfil|profile|valid|invalid|tiempo restante|remaining time|balance|saldo|"
+    r"check|comprobar|verificar|gratis|free|claim|cooldown)",
     re.IGNORECASE,
 )
 
@@ -158,6 +177,11 @@ class KeyDropSite:
     context: BrowserContext | None = field(default=None, init=False)
     page: Page | None = field(default=None, init=False)
     playwright: Playwright | None = field(default=None, init=False)
+    diagnostics_dir: Path = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.diagnostics_dir = self.balances_file.parent / "keydrop_daily_case"
+        self.diagnostics_dir.mkdir(parents=True, exist_ok=True)
 
     def run(self) -> str:
         with sync_playwright() as playwright:
@@ -189,14 +213,19 @@ class KeyDropSite:
                         steam_manager = self.prepare_daily_case_avatar_requirement()
                         button_text = self.ensure_daily_case_ready_to_open()
                         self.click_daily_case_open_button()
-                        self.human_delay(2.0, 4.0)
+                        post_open_status = self.handle_post_open_state(
+                            balance_text_before=balance_text,
+                            balance_value_before=balance_value,
+                            initial_button_text=button_text,
+                        )
 
                         self.logger.info(
-                            "Flujo de KeyDrop finalizado. Saldo detectado: %s | Boton daily case: %s",
+                            "Flujo de KeyDrop finalizado. Saldo detectado: %s | Boton daily case: %s | Estado postapertura: %s",
                             balance_text,
                             button_text or "no detectado",
+                            post_open_status,
                         )
-                        return "opened"
+                        return post_open_status
                     except KeyboardInterrupt:
                         raise
                     except Exception:
@@ -264,14 +293,19 @@ class KeyDropSite:
         assert self.page is not None
 
         self.logger.info("Abriendo %s", self.url)
-        self.page.goto(self.url, wait_until="domcontentloaded")
+        self.navigate_with_recovery(self.url, "pagina inicial de KeyDrop")
         self.wait_for_page_ready()
         self.human_delay(1.2, 2.4)
 
     def wait_for_page_ready(self) -> None:
         assert self.page is not None
 
-        self.page.wait_for_load_state("domcontentloaded")
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=12_000)
+        except PlaywrightTimeoutError:
+            self.logger.info(
+                "La pagina de KeyDrop no entro en domcontentloaded. Se continua con timeout controlado."
+            )
         try:
             self.page.wait_for_load_state("networkidle", timeout=10_000)
         except PlaywrightTimeoutError:
@@ -280,6 +314,92 @@ class KeyDropSite:
             )
 
         self.page.locator("body").wait_for(state="visible", timeout=10_000)
+
+    def navigate_with_recovery(
+        self,
+        url: str,
+        description: str,
+        attempts: int = 3,
+    ) -> None:
+        assert self.context is not None
+
+        last_error: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            assert self.page is not None
+            try:
+                self.page.goto(url, wait_until="commit", timeout=20_000)
+                return
+            except (PlaywrightTimeoutError, PlaywrightError) as exc:
+                last_error = exc
+                current_url = self.safe_current_url()
+                self.logger.warning(
+                    "No se pudo abrir %s en KeyDrop (intento %s/%s). URL actual: %s | Error: %s",
+                    description,
+                    attempt,
+                    attempts,
+                    current_url or "sin URL",
+                    exc,
+                )
+
+                if self.is_probably_on_target_url(url):
+                    self.logger.info(
+                        "KeyDrop parece haber empezado a navegar pese al error inicial. Se intenta continuar."
+                    )
+                    return
+
+                self.reset_page_after_navigation_failure()
+                self.human_delay(1.0, 2.0)
+
+        raise RuntimeError(
+            f"No se pudo abrir {description} en KeyDrop tras {attempts} intentos."
+        ) from last_error
+
+    def safe_current_url(self) -> str:
+        if self.page is None:
+            return ""
+        try:
+            return self.page.url
+        except Exception:
+            return ""
+
+    def is_probably_on_target_url(self, target_url: str) -> bool:
+        current_url = self.safe_current_url()
+        if not current_url:
+            return False
+
+        normalized_target = target_url.rstrip("/")
+        normalized_current = current_url.rstrip("/")
+        if normalized_current == normalized_target:
+            return True
+        return normalized_current.startswith(normalized_target + "/")
+
+    def stop_page_loading(self) -> None:
+        if self.page is None:
+            return
+
+        try:
+            self.page.evaluate("window.stop()")
+        except Exception:
+            pass
+
+    def reset_page_after_navigation_failure(self) -> None:
+        assert self.context is not None
+
+        self.stop_page_loading()
+
+        if self.page is not None:
+            try:
+                if not self.page.is_closed():
+                    self.page.close()
+            except Exception:
+                pass
+
+        self.page = self.context.new_page()
+        self.page.bring_to_front()
+        self.logger.info(
+            "Pestana de KeyDrop recreada tras un fallo de navegacion para salir de about:blank."
+        )
 
     def ensure_authenticated(self) -> None:
         assert self.page is not None
@@ -555,6 +675,104 @@ class KeyDropSite:
         button_locator = self.page.locator(f"xpath={DAILY_CASE_OPEN_BUTTON_XPATH}")
         self.safe_click(button_locator, "boton de apertura de daily case")
 
+    def handle_post_open_state(
+        self,
+        balance_text_before: str,
+        balance_value_before: float | None,
+        initial_button_text: str | None,
+    ) -> str:
+        assert self.page is not None
+
+        self.logger.info(
+            "Esperando el estado posterior a la apertura de la daily case de KeyDrop."
+        )
+        self.human_delay(5.0, 7.5)
+
+        reward_candidates = self.collect_visible_text_candidates()
+        reward_text = self.infer_reward_text(reward_candidates)
+        reward_kind = self.infer_reward_kind(reward_text)
+        post_open_buttons = self.collect_visible_button_texts()
+
+        if reward_text:
+            self.logger.info(
+                "Recompensa candidata detectada en KeyDrop: %s | Tipo: %s",
+                reward_text,
+                reward_kind,
+            )
+        else:
+            self.logger.warning(
+                "No se pudo inferir con claridad la recompensa de la daily case de KeyDrop."
+            )
+
+        if post_open_buttons:
+            self.logger.info(
+                "Botones visibles tras abrir la daily case de KeyDrop: %s",
+                post_open_buttons,
+            )
+        else:
+            self.logger.warning(
+                "No se detectaron botones visibles tras abrir la daily case de KeyDrop."
+            )
+
+        sell_button_text = self.find_sell_button_text()
+        sell_offer_value = self.parse_balance_value(sell_button_text) if sell_button_text else None
+        sell_clicked = False
+        balance_text_after = None
+        balance_value_after = None
+        gain_value = None
+        final_buttons = post_open_buttons
+
+        if reward_kind == "skin" and sell_button_text:
+            self.logger.info(
+                "Boton de venta detectado tras abrir la daily case de KeyDrop: %s",
+                sell_button_text,
+            )
+            sell_clicked = self.click_sell_button()
+            if sell_clicked:
+                self.human_delay(3.0, 5.0)
+                balance_text_after = self.try_read_balance_text()
+                balance_value_after = (
+                    self.parse_balance_value(balance_text_after) if balance_text_after else None
+                )
+                if balance_text_after and balance_value_after is not None:
+                    self.persist_balance(balance_text_after, balance_value_after)
+                if (
+                    balance_value_before is not None
+                    and balance_value_after is not None
+                ):
+                    gain_value = round(balance_value_after - balance_value_before, 2)
+                    self.logger.info(
+                        "Ganancia estimada por la venta en KeyDrop: %s",
+                        gain_value,
+                    )
+                final_buttons = self.collect_visible_button_texts()
+
+        elif reward_kind != "skin" and sell_button_text:
+            self.logger.info(
+                "Se ha detectado un boton de venta, pero la recompensa parece %s. No se intenta vender.",
+                reward_kind,
+            )
+
+        status = "opened_sold" if sell_clicked else "opened_unsold"
+        self.capture_post_open_diagnostics(
+            status=status,
+            balance_text_before=balance_text_before,
+            balance_value_before=balance_value_before,
+            balance_text_after=balance_text_after,
+            balance_value_after=balance_value_after,
+            initial_button_text=initial_button_text,
+            reward_text=reward_text,
+            reward_kind=reward_kind,
+            reward_candidates=reward_candidates,
+            visible_buttons_before_sell=post_open_buttons,
+            visible_buttons_after_sell=final_buttons,
+            sell_button_text=sell_button_text,
+            sell_offer_value=sell_offer_value,
+            sell_clicked=sell_clicked,
+            gain_value=gain_value,
+        )
+        return status
+
     def inspect_avatar_check_button_text(self) -> str | None:
         assert self.page is not None
 
@@ -612,6 +830,289 @@ class KeyDropSite:
 
         self.logger.warning("Toast detectado en KeyDrop: %s", toast_text)
         return True
+
+    def try_read_balance_text(self) -> str | None:
+        try:
+            return self.read_balance_text()
+        except Exception:
+            self.logger.warning("No se pudo releer el saldo de KeyDrop tras la apertura.")
+            return None
+
+    def find_sell_button_locator(self) -> Locator | None:
+        assert self.page is not None
+
+        sell_locators = [
+            self.page.get_by_role("button", name=SELL_PATTERN).first,
+            self.page.get_by_role("link", name=SELL_PATTERN).first,
+            self.page.locator("button").filter(has_text=SELL_PATTERN).first,
+            self.page.locator("a").filter(has_text=SELL_PATTERN).first,
+            self.page.locator("[role='button']").filter(has_text=SELL_PATTERN).first,
+        ]
+        return self.first_visible(sell_locators, timeout_ms=4_000)
+
+    def find_sell_button_text(self) -> str | None:
+        locator = self.find_sell_button_locator()
+        if locator is None:
+            return None
+
+        try:
+            return self.compact_text(locator.inner_text(timeout=2_000))
+        except Exception:
+            return "boton de venta detectado sin texto legible"
+
+    def click_sell_button(self) -> bool:
+        locator = self.find_sell_button_locator()
+        if locator is None:
+            return False
+        return self.safe_click(locator, "boton de vender recompensa", allow_fail=True)
+
+    def collect_visible_button_texts(self) -> list[str]:
+        assert self.page is not None
+
+        try:
+            raw_buttons = self.page.evaluate(
+                """
+                () => {
+                  const isVisible = (el) => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style &&
+                      style.visibility !== 'hidden' &&
+                      style.display !== 'none' &&
+                      rect.width > 0 &&
+                      rect.height > 0;
+                  };
+
+                  const nodes = Array.from(
+                    document.querySelectorAll("button, a, [role='button']")
+                  );
+                  return nodes
+                    .filter(isVisible)
+                    .map((el) => (el.innerText || el.textContent || "").trim())
+                    .filter((text) => text.length > 0)
+                    .slice(0, 40);
+                }
+                """
+            )
+        except Exception:
+            self.logger.warning("No se pudieron recolectar los botones visibles de KeyDrop.")
+            return []
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in raw_buttons or []:
+            text = self.compact_text(str(item))
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+        return normalized
+
+    def collect_visible_text_candidates(self) -> list[dict[str, Any]]:
+        assert self.page is not None
+
+        try:
+            raw_candidates = self.page.evaluate(
+                """
+                () => {
+                  const isVisible = (el) => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style &&
+                      style.visibility !== 'hidden' &&
+                      style.display !== 'none' &&
+                      rect.width > 0 &&
+                      rect.height > 0;
+                  };
+
+                  const nodes = Array.from(
+                    document.querySelectorAll(
+                      "h1, h2, h3, h4, p, span, div, strong, b"
+                    )
+                  );
+
+                  return nodes
+                    .filter(isVisible)
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      const style = window.getComputedStyle(el);
+                      return {
+                        text: (el.innerText || el.textContent || "").trim(),
+                        tag: el.tagName.toLowerCase(),
+                        className: typeof el.className === "string" ? el.className : "",
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                        fontSize: parseFloat(style.fontSize || "0"),
+                        fontWeight: String(style.fontWeight || ""),
+                      };
+                    })
+                    .filter((item) => item.text.length > 1)
+                    .slice(0, 200);
+                }
+                """
+            )
+        except Exception:
+            self.logger.warning("No se pudieron recolectar los textos visibles de KeyDrop.")
+            return []
+
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in raw_candidates or []:
+            text = self.compact_text(str(item.get("text", "")))
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            candidate = dict(item)
+            candidate["text"] = text
+            candidates.append(candidate)
+        return candidates
+
+    def infer_reward_text(self, candidates: list[dict[str, Any]]) -> str | None:
+        coin_reward = self.infer_coin_reward_text(candidates)
+        if coin_reward:
+            return coin_reward
+
+        filtered: list[dict[str, Any]] = []
+        for candidate in candidates:
+            text = str(candidate.get("text", "")).strip()
+            if not text:
+                continue
+            if len(text) > 100:
+                continue
+            if GENERIC_UI_TEXT_PATTERN.search(text):
+                continue
+            if re.fullmatch(r"[\d\s.,:$€£-]+", text):
+                continue
+            filtered.append(candidate)
+
+        if not filtered:
+            return None
+
+        filtered.sort(
+            key=lambda item: (
+                float(item.get("fontSize", 0) or 0),
+                float(item.get("width", 0) or 0) * float(item.get("height", 0) or 0),
+            ),
+            reverse=True,
+        )
+        return str(filtered[0].get("text", "")).strip() or None
+
+    def infer_coin_reward_text(self, candidates: list[dict[str, Any]]) -> str | None:
+        coin_candidates = [
+            candidate
+            for candidate in candidates
+            if COINS_PATTERN.search(str(candidate.get("text", "")))
+        ]
+        amount_candidates = [
+            candidate
+            for candidate in candidates
+            if re.fullmatch(r"\d{1,6}", str(candidate.get("text", "")).strip())
+        ]
+
+        for coin_candidate in coin_candidates:
+            coin_text = self.normalize_reward_label(str(coin_candidate.get("text", "")))
+            coin_x = float(coin_candidate.get("x", 0) or 0)
+            coin_y = float(coin_candidate.get("y", 0) or 0)
+            best_amount: str | None = None
+            best_distance = float("inf")
+
+            for amount_candidate in amount_candidates:
+                amount_text = str(amount_candidate.get("text", "")).strip()
+                amount_x = float(amount_candidate.get("x", 0) or 0)
+                amount_y = float(amount_candidate.get("y", 0) or 0)
+                distance = abs(amount_y - coin_y) + abs(amount_x - coin_x)
+
+                if abs(amount_y - coin_y) > 180:
+                    continue
+                if abs(amount_x - coin_x) > 250:
+                    continue
+                if distance < best_distance:
+                    best_distance = distance
+                    best_amount = amount_text
+
+            if best_amount:
+                return f"{coin_text} {best_amount}"
+        return None
+
+    def normalize_reward_label(self, text: str) -> str:
+        compact = self.compact_text(text)
+        if COINS_PATTERN.search(compact):
+            return "Gold Coins"
+        return compact
+
+    def infer_reward_kind(self, reward_text: str | None) -> str:
+        if not reward_text:
+            return "unknown"
+        if COINS_PATTERN.search(reward_text):
+            return "coins"
+        if WEAPON_REWARD_PATTERN.search(reward_text):
+            return "skin"
+        return "unknown"
+
+    def capture_post_open_diagnostics(
+        self,
+        *,
+        status: str,
+        balance_text_before: str,
+        balance_value_before: float | None,
+        balance_text_after: str | None,
+        balance_value_after: float | None,
+        initial_button_text: str | None,
+        reward_text: str | None,
+        reward_kind: str,
+        reward_candidates: list[dict[str, Any]],
+        visible_buttons_before_sell: list[str],
+        visible_buttons_after_sell: list[str],
+        sell_button_text: str | None,
+        sell_offer_value: float | None,
+        sell_clicked: bool,
+        gain_value: float | None,
+    ) -> None:
+        assert self.page is not None
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        screenshot_file = self.diagnostics_dir / f"keydrop_{timestamp}.png"
+        text_file = self.diagnostics_dir / f"keydrop_{timestamp}.txt"
+        json_file = self.diagnostics_dir / f"keydrop_{timestamp}.json"
+
+        try:
+            self.page.screenshot(path=str(screenshot_file), full_page=True)
+            body_text = self.page.locator("body").inner_text(timeout=10_000)
+            text_file.write_text(body_text, encoding="utf-8")
+
+            snapshot = {
+                "captured_at": datetime.now().astimezone().isoformat(),
+                "url": self.page.url,
+                "status": status,
+                "balance_text_before": balance_text_before,
+                "balance_value_before": balance_value_before,
+                "balance_text_after": balance_text_after,
+                "balance_value_after": balance_value_after,
+                "initial_button_text": initial_button_text,
+                "reward_text": reward_text,
+                "reward_kind": reward_kind,
+                "reward_candidates": reward_candidates[:25],
+                "visible_buttons_before_sell": visible_buttons_before_sell,
+                "visible_buttons_after_sell": visible_buttons_after_sell,
+                "sell_button_text": sell_button_text,
+                "sell_offer_value": sell_offer_value,
+                "sell_clicked": sell_clicked,
+                "gain_value": gain_value,
+            }
+            json_file.write_text(
+                json.dumps(snapshot, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self.logger.info(
+                "Diagnostico postapertura de KeyDrop guardado en %s, %s y %s.",
+                screenshot_file,
+                text_file,
+                json_file,
+            )
+        except Exception:
+            self.logger.exception("No se pudo capturar el diagnostico postapertura de KeyDrop.")
 
     def is_ready_to_open(self, button_text: str) -> bool:
         if self.is_cooldown_active(button_text):
