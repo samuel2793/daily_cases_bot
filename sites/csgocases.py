@@ -25,6 +25,11 @@ DAILY_FREE_CASE_URL_ES = "https://csgocases.com/es/case/caja-gratis-2"
 FREE_NICK_CASE_URL_ES = "https://csgocases.com/es/case/caja-gratis"
 STEAM_NICK_SUFFIX = "CS2SKINS.GIFT"
 CURRENCY_PATTERN = re.compile(r"(?:\$|€)\s*\d+(?:[.,]\d{1,2})?")
+CASE_COOLDOWN_PATTERN = re.compile(
+    r"(espera\s*\d+\s*[hm]|wait\s*\d+\s*[hm]|available in|disponible en|"
+    r"\b\d+\s*h\b|\b\d+\s*min\b)",
+    re.IGNORECASE,
+)
 
 
 class ManualFlowAborted(RuntimeError):
@@ -46,31 +51,53 @@ class CSGOCasesSite:
         nickname_manager: SteamAvatarManager | None = None
 
         try:
-            avatar_manager = self.apply_steam_avatar_requirement()
-            self.wait_for_manual_case_completion(
+            self.capture_initial_balance_before_cases()
+
+            first_case_status = self.inspect_case_availability(
                 case_label="Caja gratis 2 de CSGOCases",
                 target_url=DAILY_FREE_CASE_URL_ES,
-                requirement_label="avatar de Steam con el logo de CSGOCases",
             )
-            self.cleanup_steam_avatar_requirement(avatar_manager)
-            avatar_manager = None
-            self.capture_balance_after_manual_case(
-                case_label="Caja gratis 2 de CSGOCases",
-                source_url=DAILY_FREE_CASE_URL_ES,
-            )
+            if first_case_status != "cooldown":
+                avatar_manager = self.apply_steam_avatar_requirement()
+                self.wait_for_manual_case_completion(
+                    case_label="Caja gratis 2 de CSGOCases",
+                    target_url=DAILY_FREE_CASE_URL_ES,
+                    requirement_label="avatar de Steam con el logo de CSGOCases",
+                )
+                self.cleanup_steam_avatar_requirement(avatar_manager)
+                avatar_manager = None
+                self.capture_balance_after_manual_case(
+                    case_label="Caja gratis 2 de CSGOCases",
+                    source_url=DAILY_FREE_CASE_URL_ES,
+                )
+            else:
+                self.logger.info(
+                    "Se omite %s porque CSGOCases la muestra en cooldown.",
+                    "Caja gratis 2 de CSGOCases",
+                )
 
-            nickname_manager = self.apply_steam_profile_name_requirement()
-            self.wait_for_manual_case_completion(
+            second_case_status = self.inspect_case_availability(
                 case_label="Caja gratis de CSGOCases",
                 target_url=FREE_NICK_CASE_URL_ES,
-                requirement_label=f"nick de Steam con '{STEAM_NICK_SUFFIX}'",
             )
-            self.cleanup_steam_profile_name_requirement(nickname_manager)
-            nickname_manager = None
-            self.capture_balance_after_manual_case(
-                case_label="Caja gratis de CSGOCases",
-                source_url=FREE_NICK_CASE_URL_ES,
-            )
+            if second_case_status != "cooldown":
+                nickname_manager = self.apply_steam_profile_name_requirement()
+                self.wait_for_manual_case_completion(
+                    case_label="Caja gratis de CSGOCases",
+                    target_url=FREE_NICK_CASE_URL_ES,
+                    requirement_label=f"nick de Steam con '{STEAM_NICK_SUFFIX}'",
+                )
+                self.cleanup_steam_profile_name_requirement(nickname_manager)
+                nickname_manager = None
+                self.capture_balance_after_manual_case(
+                    case_label="Caja gratis de CSGOCases",
+                    source_url=FREE_NICK_CASE_URL_ES,
+                )
+            else:
+                self.logger.info(
+                    "Se omite %s porque CSGOCases la muestra en cooldown.",
+                    "Caja gratis de CSGOCases",
+                )
 
             self.logger.info(
                 "Flujo manual de CSGOCases finalizado. URLs objetivo: %s | %s",
@@ -199,9 +226,57 @@ class CSGOCasesSite:
             logger=logging.getLogger("daily_cases_bot.steam"),
         )
 
+    def capture_initial_balance_before_cases(self) -> None:
+        balance_text, balance_value = self.try_read_balance_with_browser(
+            target_url=self.url,
+            log_context="antes de revisar las cajas de CSGOCases",
+        )
+        if not balance_text:
+            self.logger.warning(
+                "No se pudo registrar el saldo inicial de CSGOCases antes de revisar las cajas."
+            )
+            return
+
+        saved = save_balance_snapshot(
+            balances_file=self.balances_file,
+            site_name="csgocases",
+            balance_text=balance_text,
+            balance_value=balance_value,
+            source_url=self.url,
+            logger=self.logger,
+        )
+        if saved:
+            self.logger.info(
+                "Saldo inicial detectado en CSGOCases antes de revisar las cajas: %s",
+                balance_text,
+            )
+
+    def inspect_case_availability(self, case_label: str, target_url: str) -> str:
+        body_text = self.try_read_case_body_text(target_url, case_label)
+        if not body_text:
+            self.logger.warning(
+                "No se pudo determinar si %s esta disponible. Se mantiene el flujo normal.",
+                case_label,
+            )
+            return "unknown"
+
+        if CASE_COOLDOWN_PATTERN.search(body_text):
+            self.logger.info(
+                "%s aparece en cooldown en CSGOCases. Texto detectado: %s",
+                case_label,
+                self.extract_case_cooldown_excerpt(body_text),
+            )
+            return "cooldown"
+
+        self.logger.info("%s parece disponible en CSGOCases.", case_label)
+        return "available"
+
     def capture_balance_after_manual_case(self, case_label: str, source_url: str) -> None:
         previous_balance_text, previous_balance_value = self.get_latest_known_balance()
-        current_balance_text, current_balance_value = self.try_read_balance_with_browser()
+        current_balance_text, current_balance_value = self.try_read_balance_with_browser(
+            target_url=self.url,
+            log_context="tras la apertura manual",
+        )
 
         if current_balance_text is None:
             current_balance_text = self.prompt_manual_balance(case_label)
@@ -257,7 +332,12 @@ class CSGOCasesSite:
             return None, None
         return latest.get("balance_text"), latest.get("balance_value")
 
-    def try_read_balance_with_browser(self) -> tuple[str | None, float | None]:
+    def try_read_balance_with_browser(
+        self,
+        *,
+        target_url: str,
+        log_context: str,
+    ) -> tuple[str | None, float | None]:
         session_data = load_session(self.session_file, self.logger)
         browser: Browser | None = None
         context: BrowserContext | None = None
@@ -270,25 +350,29 @@ class CSGOCasesSite:
                     session_data,
                 )
                 self.logger.info(
-                    "Revisando automaticamente el saldo de CSGOCases tras la apertura manual."
+                    "Revisando automaticamente el saldo de CSGOCases %s.",
+                    log_context,
                 )
-                page.goto(self.url, wait_until="domcontentloaded", timeout=25_000)
+                page.goto(target_url, wait_until="domcontentloaded", timeout=25_000)
                 self.wait_for_light_page_ready(page)
                 balance_text = self.find_balance_text(page)
                 if not balance_text:
                     self.logger.warning(
-                        "No se pudo localizar automaticamente el saldo de CSGOCases tras la apertura manual."
+                        "No se pudo localizar automaticamente el saldo de CSGOCases %s.",
+                        log_context,
                     )
                     return None, None
 
                 self.logger.info(
-                    "Saldo posterior detectado automaticamente en CSGOCases: %s",
+                    "Saldo detectado automaticamente en CSGOCases %s: %s",
+                    log_context,
                     balance_text,
                 )
                 return balance_text, self.parse_balance_value(balance_text)
         except Exception:
             self.logger.warning(
-                "La revision automatica del saldo de CSGOCases fallo tras la apertura manual.",
+                "La revision automatica del saldo de CSGOCases fallo %s.",
+                log_context,
                 exc_info=True,
             )
             return None, None
@@ -303,6 +387,47 @@ class CSGOCasesSite:
                     browser.close()
                 except Exception:
                     pass
+
+    def try_read_case_body_text(self, target_url: str, case_label: str) -> str | None:
+        session_data = load_session(self.session_file, self.logger)
+        browser: Browser | None = None
+        context: BrowserContext | None = None
+        page: Page | None = None
+
+        try:
+            with sync_playwright() as playwright:
+                browser, context, page = self.open_balance_check_browser(
+                    playwright,
+                    session_data,
+                )
+                self.logger.info("Comprobando disponibilidad de %s.", case_label)
+                page.goto(target_url, wait_until="domcontentloaded", timeout=25_000)
+                self.wait_for_light_page_ready(page)
+                return self.compact_text(page.locator("body").inner_text(timeout=10_000))
+        except Exception:
+            self.logger.warning(
+                "La comprobacion de disponibilidad de %s fallo en CSGOCases.",
+                case_label,
+                exc_info=True,
+            )
+            return None
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+    def extract_case_cooldown_excerpt(self, body_text: str) -> str:
+        match = CASE_COOLDOWN_PATTERN.search(body_text)
+        if not match:
+            return "sin texto de cooldown"
+        return match.group(0)
 
     def open_balance_check_browser(
         self,
