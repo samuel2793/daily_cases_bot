@@ -3,7 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 
-const client = new SteamUser();
+const client = new SteamUser({
+    renewRefreshTokens: true
+});
 
 const SECRETS_DIR = path.join(__dirname, 'secrets');
 const CREDENTIALS_FILE = path.join(SECRETS_DIR, 'steam_presence.json');
@@ -12,6 +14,10 @@ const CREDENTIALS_TEMPLATE = {
     accountName: 'tu_usuario_steam',
     password: 'tu_password_steam'
 };
+const PLACEHOLDER_VALUES = new Set([
+    CREDENTIALS_TEMPLATE.accountName,
+    CREDENTIALS_TEMPLATE.password
+]);
 
 let logOnOptions;
 let pendingSteamGuardCallback = null;
@@ -40,34 +46,6 @@ stdinInterface.on('line', (line) => {
     callback(code);
 });
 
-if (fs.existsSync(REFRESH_TOKEN_FILE)) {
-    logOnOptions = {
-        refreshToken: fs.readFileSync(REFRESH_TOKEN_FILE, 'utf8').trim()
-    };
-} else if (fs.existsSync(CREDENTIALS_FILE)) {
-    const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_FILE, 'utf8'));
-
-    if (!credentials.accountName || !credentials.password) {
-        throw new Error(
-            `El archivo ${CREDENTIALS_FILE} debe contener accountName y password.`
-        );
-    }
-
-    logOnOptions = {
-        accountName: credentials.accountName,
-        password: credentials.password
-    };
-} else {
-    fs.mkdirSync(SECRETS_DIR, { recursive: true });
-    fs.writeFileSync(
-        CREDENTIALS_FILE,
-        JSON.stringify(CREDENTIALS_TEMPLATE, null, 2) + '\n'
-    );
-    throw new Error(
-        `No existe ${REFRESH_TOKEN_FILE}. Se ha generado ${CREDENTIALS_FILE}; rellena accountName y password y vuelve a ejecutar.`
-    );
-}
-
 function terminateProcess(exitCode, message) {
     if (message) {
         console.error(message);
@@ -77,8 +55,6 @@ function terminateProcess(exitCode, message) {
     stdinInterface.close();
     process.exit(exitCode);
 }
-
-client.logOn(logOnOptions);
 
 client.on('steamGuard', (domain, callback) => {
     if (steamGuardSatisfied) {
@@ -133,3 +109,152 @@ client.on('error', (error) => {
     console.error(error);
     terminateProcess(1);
 });
+
+function ensureSecretsDir() {
+    fs.mkdirSync(SECRETS_DIR, { recursive: true });
+}
+
+function hasUsableCredentials(credentials) {
+    return Boolean(
+        credentials &&
+        credentials.accountName &&
+        credentials.password &&
+        !PLACEHOLDER_VALUES.has(credentials.accountName) &&
+        !PLACEHOLDER_VALUES.has(credentials.password)
+    );
+}
+
+function loadCredentialsIfPresent() {
+    if (!fs.existsSync(CREDENTIALS_FILE)) {
+        return null;
+    }
+
+    const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_FILE, 'utf8'));
+    if (!hasUsableCredentials(credentials)) {
+        return null;
+    }
+
+    return credentials;
+}
+
+function writeCredentialsTemplateIfMissing() {
+    ensureSecretsDir();
+    if (fs.existsSync(CREDENTIALS_FILE)) {
+        return;
+    }
+
+    fs.writeFileSync(
+        CREDENTIALS_FILE,
+        JSON.stringify(CREDENTIALS_TEMPLATE, null, 2) + '\n'
+    );
+}
+
+async function bootstrapRefreshTokenWithQR() {
+    ensureSecretsDir();
+    writeCredentialsTemplateIfMissing();
+
+    let qrcodeTerminal;
+    let LoginSession;
+    let EAuthTokenPlatformType;
+
+    try {
+        qrcodeTerminal = require('qrcode-terminal');
+        ({
+            LoginSession,
+            EAuthTokenPlatformType
+        } = require('steam-session'));
+    } catch (error) {
+        throw new Error(
+            "Faltan dependencias para el login por QR de Steam Presence. Ejecuta 'npm install' en este directorio."
+        );
+    }
+
+    const loginSession = new LoginSession(EAuthTokenPlatformType.SteamClient);
+    loginSession.loginTimeout = 180000;
+
+    return await new Promise(async (resolve, reject) => {
+        let settled = false;
+
+        const finishResolve = (value) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            resolve(value);
+        };
+
+        const finishReject = (error) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            reject(error);
+        };
+
+        loginSession.on('authenticated', () => {
+            if (!loginSession.refreshToken) {
+                finishReject(new Error('Steam QR autenticado pero sin refresh token.'));
+                return;
+            }
+
+            fs.writeFileSync(REFRESH_TOKEN_FILE, loginSession.refreshToken);
+            console.log('Refresh token guardado');
+            finishResolve({
+                refreshToken: loginSession.refreshToken
+            });
+        });
+
+        loginSession.on('timeout', () => {
+            finishReject(new Error('QR de Steam expirado antes de ser confirmado.'));
+        });
+
+        loginSession.on('remoteInteraction', () => {
+            console.log('QR de Steam escaneado. Confirma el acceso en Steam Guard.');
+        });
+
+        loginSession.on('error', (error) => {
+            finishReject(error);
+        });
+
+        try {
+            const startResult = await loginSession.startWithQR();
+            console.log('Escanea este QR con Steam Guard para autorizar Steam Presence:');
+            qrcodeTerminal.generate(startResult.qrChallengeUrl, {small: true});
+            console.log(startResult.qrChallengeUrl);
+        } catch (error) {
+            finishReject(error);
+        }
+    });
+}
+
+async function resolveLogOnOptions() {
+    if (fs.existsSync(REFRESH_TOKEN_FILE)) {
+        return {
+            refreshToken: fs.readFileSync(REFRESH_TOKEN_FILE, 'utf8').trim()
+        };
+    }
+
+    const credentials = loadCredentialsIfPresent();
+    if (credentials) {
+        return {
+            accountName: credentials.accountName,
+            password: credentials.password
+        };
+    }
+
+    return await bootstrapRefreshTokenWithQR();
+}
+
+(async () => {
+    try {
+        logOnOptions = await resolveLogOnOptions();
+        client.logOn(logOnOptions);
+    } catch (error) {
+        terminateProcess(
+            1,
+            error && error.message
+                ? error.message
+                : 'No se pudo inicializar Steam Presence.'
+        );
+    }
+})();
