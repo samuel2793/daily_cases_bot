@@ -6,6 +6,7 @@ from pathlib import Path
 
 from services import SteamPresenceService
 from sites.bloodycase import BloodyCaseSite
+from sites.cs2free import CS2FreeSite
 from sites.csgocases import CSGOCasesSite
 from sites.keydrop import KeyDropSite
 from sites.steam_playtime import SteamPlaytimeMonitor, format_hours_and_minutes
@@ -49,6 +50,7 @@ def main() -> None:
     ensure_runtime_dirs()
     logger = configure_logging()
     bloodycase_session_file = SESSIONS_DIR / "bloodycase_session.json"
+    cs2free_session_file = SESSIONS_DIR / "cs2free_session.json"
     csgocases_session_file = SESSIONS_DIR / "csgocases_session.json"
     session_file = SESSIONS_DIR / "session.json"
     steam_session_file = SESSIONS_DIR / "steam_session.json"
@@ -83,6 +85,7 @@ def main() -> None:
     keydrop_result = "not_started"
     csgocases_result = "not_started"
     bloodycase_result = "not_started"
+    cs2free_result = "not_started"
 
     try:
         recent_hours = playtime_monitor.check_recent_hours_once()
@@ -123,6 +126,13 @@ def main() -> None:
             logger=logging.getLogger("daily_cases_bot.bloodycase"),
         )
         bloodycase_result = bloodycase_site.run()
+        logger.info("Inicializando bot para CS2.free.")
+        cs2free_site = CS2FreeSite(
+            session_file=cs2free_session_file,
+            workspace_dir=DATA_DIR,
+            logger=logging.getLogger("daily_cases_bot.cs2free"),
+        )
+        cs2free_result = cs2free_site.run()
     except KeyboardInterrupt:
         logger.info("Ejecucion interrumpida por el usuario.")
     except Exception:
@@ -137,13 +147,14 @@ def main() -> None:
         except KeyboardInterrupt:
             logger.info("Cierre interrumpido por el usuario mientras se detenia Steam Presence.")
         logger.info(
-            "Resumen final | Steam: %s | KeyDrop: %s | CSGOCases: %s | BloodyCase: %s",
+            "Resumen final | Steam: %s | KeyDrop: %s | CSGOCases: %s | BloodyCase: %s | CS2.free: %s",
             format_hours_and_minutes(recent_hours)
             if "recent_hours" in locals()
             else "sin comprobar",
             keydrop_result,
             csgocases_result,
             bloodycase_result,
+            cs2free_result,
         )
 
 
