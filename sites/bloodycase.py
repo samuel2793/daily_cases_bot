@@ -119,11 +119,11 @@ class BloodyCaseSite:
                                 sell_clicked=False,
                                 gain_value=None,
                             )
-                            self.logger.warning(
-                                "No se encontro el boton CLAIM de BloodyCase. Saldo detectado: %s",
+                            self.logger.info(
+                                "BloodyCase no mostro boton CLAIM tras cargar la daily free. Se interpreta como cooldown/no disponible. Saldo detectado: %s",
                                 balance_text,
                             )
-                            return "button_not_found"
+                            return "cooldown"
 
                         if not CLAIM_PATTERN.search(button_text):
                             self.capture_post_claim_diagnostics(
