@@ -10,6 +10,7 @@ from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -149,6 +150,7 @@ class DashboardWindow(QMainWindow):
         self.prompt_bridge = PromptBridge()
         self.runner_thread: RunnerThread | None = None
         self.current_run_progress: dict[str, dict[str, str]] = {}
+        self.all_diagnostic_rows: list[dict[str, object]] = []
         self.diagnostic_rows: list[dict[str, object]] = []
         self.cancel_requested_in_ui = False
 
@@ -304,6 +306,17 @@ class DashboardWindow(QMainWindow):
         diagnostics_tab = QWidget()
         diagnostics_layout = QVBoxLayout(diagnostics_tab)
 
+        diagnostics_filters_layout = QHBoxLayout()
+        diagnostics_filters_layout.addWidget(QLabel("Sitio"))
+        self.diagnostic_site_filter = QComboBox()
+        self.diagnostic_site_filter.addItem("Todos")
+        diagnostics_filters_layout.addWidget(self.diagnostic_site_filter)
+        diagnostics_filters_layout.addWidget(QLabel("Fecha"))
+        self.diagnostic_date_filter = QComboBox()
+        self.diagnostic_date_filter.addItem("Todas")
+        diagnostics_filters_layout.addWidget(self.diagnostic_date_filter)
+        diagnostics_filters_layout.addStretch(1)
+
         diagnostics_actions_layout = QHBoxLayout()
         self.open_diagnostic_image_button = QPushButton("Abrir captura")
         self.open_diagnostic_text_button = QPushButton("Abrir texto")
@@ -313,9 +326,9 @@ class DashboardWindow(QMainWindow):
         diagnostics_actions_layout.addWidget(self.open_diagnostic_json_button)
         diagnostics_actions_layout.addStretch(1)
 
-        self.diagnostics_table = QTableWidget(0, 5)
+        self.diagnostics_table = QTableWidget(0, 8)
         self.diagnostics_table.setHorizontalHeaderLabels(
-            ["Fecha", "Sitio", "Estado", "Recompensa", "Archivo"]
+            ["Fecha", "Sitio", "Estado", "Recompensa", "PNG", "TXT", "JSON", "Archivo"]
         )
         self.diagnostics_table.verticalHeader().setVisible(False)
         self.diagnostics_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -331,6 +344,7 @@ class DashboardWindow(QMainWindow):
         self.diagnostic_preview = QPlainTextEdit()
         self.diagnostic_preview.setReadOnly(True)
 
+        diagnostics_layout.addLayout(diagnostics_filters_layout)
         diagnostics_layout.addLayout(diagnostics_actions_layout)
         diagnostics_layout.addWidget(self.diagnostics_table, stretch=1)
         diagnostics_layout.addWidget(self.diagnostic_files_label)
@@ -350,6 +364,15 @@ class DashboardWindow(QMainWindow):
         self.prompt_bridge.prompt_requested.connect(self.show_prompt_dialog)
         self.diagnostics_table.itemSelectionChanged.connect(
             self.on_diagnostic_selection_changed
+        )
+        self.diagnostics_table.itemDoubleClicked.connect(
+            lambda _: self.open_selected_diagnostic_file("image")
+        )
+        self.diagnostic_site_filter.currentIndexChanged.connect(
+            lambda _: self.apply_diagnostic_filters()
+        )
+        self.diagnostic_date_filter.currentIndexChanged.connect(
+            lambda _: self.apply_diagnostic_filters()
         )
         self.open_diagnostic_image_button.clicked.connect(
             lambda: self.open_selected_diagnostic_file("image")
@@ -712,7 +735,64 @@ class DashboardWindow(QMainWindow):
 
     def refresh_diagnostics_table(self) -> None:
         previous_row_index = self.diagnostics_table.currentRow()
-        self.diagnostic_rows = self.history_store.get_recent_diagnostics(80)
+        previous_site = self.diagnostic_site_filter.currentText()
+        previous_date = self.diagnostic_date_filter.currentText()
+        self.all_diagnostic_rows = self.history_store.get_recent_diagnostics(80)
+        self.populate_diagnostic_filters(previous_site, previous_date)
+        self.apply_diagnostic_filters(previous_row_index)
+
+    def populate_diagnostic_filters(
+        self,
+        previous_site: str,
+        previous_date: str,
+    ) -> None:
+        sites = sorted(
+            {
+                str(row.get("site_name") or "-")
+                for row in self.all_diagnostic_rows
+                if row.get("site_name")
+            }
+        )
+        dates = sorted(
+            {
+                self.extract_diagnostic_date(row)
+                for row in self.all_diagnostic_rows
+                if self.extract_diagnostic_date(row) != "-"
+            },
+            reverse=True,
+        )
+
+        self.diagnostic_site_filter.blockSignals(True)
+        self.diagnostic_date_filter.blockSignals(True)
+
+        self.diagnostic_site_filter.clear()
+        self.diagnostic_site_filter.addItem("Todos")
+        self.diagnostic_site_filter.addItems(sites)
+
+        self.diagnostic_date_filter.clear()
+        self.diagnostic_date_filter.addItem("Todas")
+        self.diagnostic_date_filter.addItems(dates)
+
+        site_index = self.diagnostic_site_filter.findText(previous_site)
+        date_index = self.diagnostic_date_filter.findText(previous_date)
+        self.diagnostic_site_filter.setCurrentIndex(site_index if site_index >= 0 else 0)
+        self.diagnostic_date_filter.setCurrentIndex(date_index if date_index >= 0 else 0)
+
+        self.diagnostic_site_filter.blockSignals(False)
+        self.diagnostic_date_filter.blockSignals(False)
+
+    def apply_diagnostic_filters(self, preferred_row_index: int = 0) -> None:
+        selected_site = self.diagnostic_site_filter.currentText()
+        selected_date = self.diagnostic_date_filter.currentText()
+        self.diagnostic_rows = [
+            row
+            for row in self.all_diagnostic_rows
+            if (selected_site in ("", "Todos") or str(row.get("site_name") or "-") == selected_site)
+            and (
+                selected_date in ("", "Todas")
+                or self.extract_diagnostic_date(row) == selected_date
+            )
+        ]
         self.diagnostics_table.setRowCount(len(self.diagnostic_rows))
         for row_index, row in enumerate(self.diagnostic_rows):
             reward_text = str(row.get("reward_text") or "-")
@@ -725,11 +805,13 @@ class DashboardWindow(QMainWindow):
             if diagnostic_path_value:
                 diagnostic_name = Path(str(diagnostic_path_value)).name
 
+            json_path, image_path, text_path = self.get_diagnostic_paths(row)
+
             self.set_table_item(
                 self.diagnostics_table,
                 row_index,
                 0,
-                str(row.get("created_at") or "-"),
+                self.extract_diagnostic_date(row),
             )
             self.set_table_item(
                 self.diagnostics_table,
@@ -744,17 +826,40 @@ class DashboardWindow(QMainWindow):
                 str(row.get("status") or "-"),
             )
             self.set_table_item(self.diagnostics_table, row_index, 3, reward_text)
-            self.set_table_item(self.diagnostics_table, row_index, 4, diagnostic_name)
+            self.set_presence_item(
+                self.diagnostics_table,
+                row_index,
+                4,
+                image_path is not None and image_path.exists(),
+            )
+            self.set_presence_item(
+                self.diagnostics_table,
+                row_index,
+                5,
+                text_path is not None and text_path.exists(),
+            )
+            self.set_presence_item(
+                self.diagnostics_table,
+                row_index,
+                6,
+                json_path is not None and json_path.exists(),
+            )
+            self.set_table_item(self.diagnostics_table, row_index, 7, diagnostic_name)
 
         if self.diagnostic_rows:
-            target_row = previous_row_index if previous_row_index >= 0 else 0
+            target_row = preferred_row_index if preferred_row_index >= 0 else 0
             target_row = min(target_row, len(self.diagnostic_rows) - 1)
             self.diagnostics_table.selectRow(target_row)
             self.on_diagnostic_selection_changed()
         else:
-            self.diagnostic_files_label.setText(
-                "No hay diagnosticos guardados todavia."
-            )
+            if self.all_diagnostic_rows:
+                self.diagnostic_files_label.setText(
+                    "No hay diagnosticos que coincidan con los filtros."
+                )
+            else:
+                self.diagnostic_files_label.setText(
+                    "No hay diagnosticos guardados todavia."
+                )
             self.diagnostic_preview.clear()
             self.update_diagnostics_actions()
 
@@ -805,6 +910,12 @@ class DashboardWindow(QMainWindow):
         if row_index < 0 or row_index >= len(self.diagnostic_rows):
             return None
         return self.diagnostic_rows[row_index]
+
+    def extract_diagnostic_date(self, row: dict[str, object]) -> str:
+        created_at = str(row.get("created_at") or "").strip()
+        if len(created_at) >= 10:
+            return created_at[:10]
+        return created_at or "-"
 
     def get_diagnostic_paths(
         self,
@@ -871,6 +982,19 @@ class DashboardWindow(QMainWindow):
     ) -> None:
         table.setItem(row, column, QTableWidgetItem(value))
 
+    def set_presence_item(
+        self,
+        table: QTableWidget,
+        row: int,
+        column: int,
+        present: bool,
+    ) -> None:
+        item = QTableWidgetItem("Si" if present else "No")
+        item.setTextAlignment(Qt.AlignCenter)
+        item.setForeground(QColor("#111111"))
+        item.setBackground(QColor("#b7e4c7") if present else QColor("#f5c2c7"))
+        table.setItem(row, column, item)
+
     def format_amount(self, value: object) -> str:
         if value is None:
             return "-"
@@ -883,6 +1007,16 @@ class DashboardWindow(QMainWindow):
 
 def launch_app(base_dir: Path) -> int:
     app = QApplication.instance() or QApplication([])
+    base_font = QFont()
+    base_font.setFamilies(
+        [
+            "Noto Sans Sinhala",
+            "Noto Sans",
+            "DejaVu Sans",
+            "Sans Serif",
+        ]
+    )
+    app.setFont(base_font)
     window = DashboardWindow(base_dir)
     window.show()
     return app.exec()
