@@ -687,12 +687,25 @@ class KeyDropSite:
         self.logger.info(
             "Esperando el estado posterior a la apertura de la daily case de KeyDrop."
         )
-        self.human_delay(5.0, 7.5)
+        self.human_delay(7.5, 10.0)
 
         reward_candidates = self.collect_visible_text_candidates()
         reward_text = self.infer_reward_text(reward_candidates)
         reward_kind = self.infer_reward_kind(reward_text)
         post_open_buttons = self.collect_visible_button_texts()
+        sell_button_text = self.find_sell_button_text()
+
+        if reward_kind != "skin" and sell_button_text:
+            self.logger.info(
+                "KeyDrop aun no muestra una recompensa de skin clara pese a que ya existe un boton de venta. "
+                "Se espera un poco mas y se relee el estado postapertura."
+            )
+            self.human_delay(3.0, 5.0)
+            reward_candidates = self.collect_visible_text_candidates()
+            reward_text = self.infer_reward_text(reward_candidates)
+            reward_kind = self.infer_reward_kind(reward_text)
+            post_open_buttons = self.collect_visible_button_texts()
+            sell_button_text = self.find_sell_button_text()
 
         if reward_text:
             self.logger.info(
@@ -715,7 +728,6 @@ class KeyDropSite:
                 "No se detectaron botones visibles tras abrir la daily case de KeyDrop."
             )
 
-        sell_button_text = self.find_sell_button_text()
         sell_offer_value = self.parse_balance_value(sell_button_text) if sell_button_text else None
         sell_clicked = False
         balance_text_after = None
@@ -971,6 +983,10 @@ class KeyDropSite:
         return candidates
 
     def infer_reward_text(self, candidates: list[dict[str, Any]]) -> str | None:
+        skin_reward = self.infer_skin_reward_text(candidates)
+        if skin_reward:
+            return skin_reward
+
         coin_reward = self.infer_coin_reward_text(candidates)
         if coin_reward:
             return coin_reward
@@ -999,6 +1015,117 @@ class KeyDropSite:
             reverse=True,
         )
         return str(filtered[0].get("text", "")).strip() or None
+
+    def infer_skin_reward_text(self, candidates: list[dict[str, Any]]) -> str | None:
+        sell_locator = self.find_sell_button_locator()
+        if sell_locator is None:
+            return None
+
+        try:
+            sell_box = sell_locator.bounding_box()
+        except Exception:
+            return None
+
+        if not sell_box:
+            return None
+
+        sell_center_x = float(sell_box["x"]) + (float(sell_box["width"]) / 2)
+        sell_top_y = float(sell_box["y"])
+        nearby_candidates: list[dict[str, Any]] = []
+
+        for candidate in candidates:
+            text = str(candidate.get("text", "")).strip()
+            if not text or len(text) > 80:
+                continue
+            if re.fullmatch(r"[\d\s.,:$€£-]+", text):
+                continue
+            if COINS_PATTERN.search(text):
+                continue
+            if SELL_PATTERN.search(text):
+                continue
+            if re.search(r"\b(nivel|volver|mejorar|online|pausar|saldo)\b", text, re.IGNORECASE):
+                continue
+
+            candidate_x = float(candidate.get("x", 0) or 0)
+            candidate_y = float(candidate.get("y", 0) or 0)
+            candidate_width = float(candidate.get("width", 0) or 0)
+            candidate_center_x = candidate_x + (candidate_width / 2)
+
+            if candidate_y > sell_top_y + 15:
+                continue
+            if sell_top_y - candidate_y > 260:
+                continue
+            if abs(candidate_center_x - sell_center_x) > 220:
+                continue
+
+            nearby_candidates.append(candidate)
+
+        weapon_candidates = [
+            candidate
+            for candidate in nearby_candidates
+            if WEAPON_REWARD_PATTERN.search(str(candidate.get("text", "")))
+        ]
+        if not weapon_candidates:
+            return None
+
+        weapon_candidates.sort(
+            key=lambda item: (
+                abs(
+                    (
+                        float(item.get("x", 0) or 0)
+                        + (float(item.get("width", 0) or 0) / 2)
+                    )
+                    - sell_center_x
+                ),
+                abs(sell_top_y - float(item.get("y", 0) or 0)),
+                -float(item.get("fontSize", 0) or 0),
+            )
+        )
+        weapon_text = str(weapon_candidates[0].get("text", "")).strip()
+        weapon_y = float(weapon_candidates[0].get("y", 0) or 0)
+        weapon_center_x = float(weapon_candidates[0].get("x", 0) or 0) + (
+            float(weapon_candidates[0].get("width", 0) or 0) / 2
+        )
+
+        finish_candidates = []
+        for candidate in nearby_candidates:
+            text = str(candidate.get("text", "")).strip()
+            if not text or text == weapon_text:
+                continue
+            if WEAPON_REWARD_PATTERN.search(text):
+                continue
+            if len(text) > 40:
+                continue
+
+            candidate_y = float(candidate.get("y", 0) or 0)
+            candidate_center_x = float(candidate.get("x", 0) or 0) + (
+                float(candidate.get("width", 0) or 0) / 2
+            )
+            if abs(candidate_y - weapon_y) > 90:
+                continue
+            if abs(candidate_center_x - weapon_center_x) > 140:
+                continue
+            finish_candidates.append(candidate)
+
+        if not finish_candidates:
+            return weapon_text
+
+        finish_candidates.sort(
+            key=lambda item: (
+                abs(float(item.get("y", 0) or 0) - weapon_y),
+                abs(
+                    (
+                        float(item.get("x", 0) or 0)
+                        + (float(item.get("width", 0) or 0) / 2)
+                    )
+                    - weapon_center_x
+                ),
+            )
+        )
+        finish_text = self.normalize_skin_finish(
+            str(finish_candidates[0].get("text", "")).strip()
+        )
+        return f"{weapon_text} | {finish_text}"
 
     def infer_coin_reward_text(self, candidates: list[dict[str, Any]]) -> str | None:
         coin_candidates = [
@@ -1041,6 +1168,14 @@ class KeyDropSite:
         compact = self.compact_text(text)
         if COINS_PATTERN.search(compact):
             return "Gold Coins"
+        return compact
+
+    def normalize_skin_finish(self, text: str) -> str:
+        compact = self.compact_text(text)
+        if not compact:
+            return compact
+        if compact.upper() == compact:
+            return compact.lower().title()
         return compact
 
     def infer_reward_kind(self, reward_text: str | None) -> str:
