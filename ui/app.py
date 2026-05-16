@@ -6,8 +6,8 @@ import threading
 import unicodedata
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QPixmap
+from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QGridLayout,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -143,6 +144,7 @@ class DashboardWindow(QMainWindow):
         self.prompt_bridge = PromptBridge()
         self.runner_thread: RunnerThread | None = None
         self.current_run_progress: dict[str, dict[str, str]] = {}
+        self.diagnostic_rows: list[dict[str, object]] = []
 
         self.setWindowTitle("Daily Cases Bot")
         self.resize(1360, 920)
@@ -154,6 +156,12 @@ class DashboardWindow(QMainWindow):
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
         root_layout = QVBoxLayout(central_widget)
+
+        self.tabs = QTabWidget()
+        root_layout.addWidget(self.tabs)
+
+        dashboard_tab = QWidget()
+        dashboard_layout = QVBoxLayout(dashboard_tab)
 
         header_layout = QHBoxLayout()
 
@@ -278,20 +286,70 @@ class DashboardWindow(QMainWindow):
         bottom_splitter.setStretchFactor(0, 1)
         bottom_splitter.setStretchFactor(1, 1)
 
-        root_layout.addLayout(header_layout)
-        root_layout.addLayout(actions_layout)
-        root_layout.addWidget(top_splitter, stretch=1)
-        root_layout.addWidget(bottom_splitter, stretch=1)
+        dashboard_layout.addLayout(header_layout)
+        dashboard_layout.addLayout(actions_layout)
+        dashboard_layout.addWidget(top_splitter, stretch=1)
+        dashboard_layout.addWidget(bottom_splitter, stretch=1)
+        self.tabs.addTab(dashboard_tab, "Panel")
+
+        diagnostics_tab = QWidget()
+        diagnostics_layout = QVBoxLayout(diagnostics_tab)
+
+        diagnostics_actions_layout = QHBoxLayout()
+        self.open_diagnostic_image_button = QPushButton("Abrir captura")
+        self.open_diagnostic_text_button = QPushButton("Abrir texto")
+        self.open_diagnostic_json_button = QPushButton("Abrir JSON")
+        diagnostics_actions_layout.addWidget(self.open_diagnostic_image_button)
+        diagnostics_actions_layout.addWidget(self.open_diagnostic_text_button)
+        diagnostics_actions_layout.addWidget(self.open_diagnostic_json_button)
+        diagnostics_actions_layout.addStretch(1)
+
+        self.diagnostics_table = QTableWidget(0, 5)
+        self.diagnostics_table.setHorizontalHeaderLabels(
+            ["Fecha", "Sitio", "Estado", "Recompensa", "Archivo"]
+        )
+        self.diagnostics_table.verticalHeader().setVisible(False)
+        self.diagnostics_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.diagnostics_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.diagnostics_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.diagnostics_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Stretch
+        )
+
+        self.diagnostic_files_label = QLabel("Selecciona un diagnostico para ver sus archivos.")
+        self.diagnostic_files_label.setWordWrap(True)
+
+        self.diagnostic_preview = QPlainTextEdit()
+        self.diagnostic_preview.setReadOnly(True)
+
+        diagnostics_layout.addLayout(diagnostics_actions_layout)
+        diagnostics_layout.addWidget(self.diagnostics_table, stretch=1)
+        diagnostics_layout.addWidget(self.diagnostic_files_label)
+        diagnostics_layout.addWidget(self.diagnostic_preview, stretch=1)
+        self.tabs.addTab(diagnostics_tab, "Diagnosticos")
 
         exit_action = QAction("Salir", self)
         exit_action.triggered.connect(self.close)
         self.addAction(exit_action)
+        self.update_diagnostics_actions()
 
     def _wire_signals(self) -> None:
         self.run_button.clicked.connect(self.start_run)
         self.refresh_button.clicked.connect(self.refresh_dashboard)
         self.log_emitter.message.connect(self.append_log)
         self.prompt_bridge.prompt_requested.connect(self.show_prompt_dialog)
+        self.diagnostics_table.itemSelectionChanged.connect(
+            self.on_diagnostic_selection_changed
+        )
+        self.open_diagnostic_image_button.clicked.connect(
+            lambda: self.open_selected_diagnostic_file("image")
+        )
+        self.open_diagnostic_text_button.clicked.connect(
+            lambda: self.open_selected_diagnostic_file("text")
+        )
+        self.open_diagnostic_json_button.clicked.connect(
+            lambda: self.open_selected_diagnostic_file("json")
+        )
         self.update_steam_panel(get_steam_status_snapshot())
 
     def _make_value_label(self, text: str) -> QLabel:
@@ -311,7 +369,6 @@ class DashboardWindow(QMainWindow):
                 "Noto Sans Sinhala",
                 "Noto Sans",
                 "DejaVu Sans",
-                "Adwaita Sans",
                 "Sans Serif",
             ]
         )
@@ -435,6 +492,8 @@ class DashboardWindow(QMainWindow):
                 4,
                 self.format_amount(row.get("balance_delta")),
             )
+
+        self.refresh_diagnostics_table()
 
     def refresh_site_table(self, latest_site_rows: dict[str, dict[str, object]]) -> None:
         ordered_sites = ["keydrop", "csgocases", "bloodycase", "cs2free"]
@@ -614,6 +673,146 @@ class DashboardWindow(QMainWindow):
         self.log_output.verticalScrollBar().setValue(
             self.log_output.verticalScrollBar().maximum()
         )
+
+    def refresh_diagnostics_table(self) -> None:
+        previous_row_index = self.diagnostics_table.currentRow()
+        self.diagnostic_rows = self.history_store.get_recent_diagnostics(80)
+        self.diagnostics_table.setRowCount(len(self.diagnostic_rows))
+        for row_index, row in enumerate(self.diagnostic_rows):
+            reward_text = str(row.get("reward_text") or "-")
+            reward_kind = str(row.get("reward_kind") or "")
+            if reward_kind and reward_kind != "unknown" and reward_text != "-":
+                reward_text = f"{reward_text} [{reward_kind}]"
+
+            diagnostic_name = "-"
+            diagnostic_path_value = row.get("diagnostic_json_path")
+            if diagnostic_path_value:
+                diagnostic_name = Path(str(diagnostic_path_value)).name
+
+            self.set_table_item(
+                self.diagnostics_table,
+                row_index,
+                0,
+                str(row.get("created_at") or "-"),
+            )
+            self.set_table_item(
+                self.diagnostics_table,
+                row_index,
+                1,
+                str(row.get("site_name") or "-"),
+            )
+            self.set_table_item(
+                self.diagnostics_table,
+                row_index,
+                2,
+                str(row.get("status") or "-"),
+            )
+            self.set_table_item(self.diagnostics_table, row_index, 3, reward_text)
+            self.set_table_item(self.diagnostics_table, row_index, 4, diagnostic_name)
+
+        if self.diagnostic_rows:
+            target_row = previous_row_index if previous_row_index >= 0 else 0
+            target_row = min(target_row, len(self.diagnostic_rows) - 1)
+            self.diagnostics_table.selectRow(target_row)
+            self.on_diagnostic_selection_changed()
+        else:
+            self.diagnostic_files_label.setText(
+                "No hay diagnosticos guardados todavia."
+            )
+            self.diagnostic_preview.clear()
+            self.update_diagnostics_actions()
+
+    def on_diagnostic_selection_changed(self) -> None:
+        row = self.get_selected_diagnostic_row()
+        if row is None:
+            self.diagnostic_files_label.setText(
+                "Selecciona un diagnostico para ver sus archivos."
+            )
+            self.diagnostic_preview.clear()
+            self.update_diagnostics_actions()
+            return
+
+        json_path, image_path, text_path = self.get_diagnostic_paths(row)
+        file_parts = [
+            f"JSON: {json_path.name if json_path else '-'}",
+            f"PNG: {image_path.name if image_path else '-'}",
+            f"TXT: {text_path.name if text_path else '-'}",
+        ]
+        self.diagnostic_files_label.setText(" | ".join(file_parts))
+
+        preview_text = ""
+        preview_path = text_path if text_path and text_path.exists() else json_path
+        if preview_path and preview_path.exists():
+            try:
+                preview_text = preview_path.read_text(encoding="utf-8")
+            except Exception as exc:
+                preview_text = f"No se pudo leer {preview_path.name}: {exc}"
+
+        self.diagnostic_preview.setPlainText(preview_text[:12_000])
+        self.update_diagnostics_actions()
+
+    def update_diagnostics_actions(self) -> None:
+        row = self.get_selected_diagnostic_row()
+        json_path, image_path, text_path = self.get_diagnostic_paths(row)
+        self.open_diagnostic_image_button.setEnabled(
+            image_path is not None and image_path.exists()
+        )
+        self.open_diagnostic_text_button.setEnabled(
+            text_path is not None and text_path.exists()
+        )
+        self.open_diagnostic_json_button.setEnabled(
+            json_path is not None and json_path.exists()
+        )
+
+    def get_selected_diagnostic_row(self) -> dict[str, object] | None:
+        row_index = self.diagnostics_table.currentRow()
+        if row_index < 0 or row_index >= len(self.diagnostic_rows):
+            return None
+        return self.diagnostic_rows[row_index]
+
+    def get_diagnostic_paths(
+        self,
+        row: dict[str, object] | None,
+    ) -> tuple[Path | None, Path | None, Path | None]:
+        if not row:
+            return None, None, None
+
+        diagnostic_json_path = row.get("diagnostic_json_path")
+        if not diagnostic_json_path:
+            return None, None, None
+
+        json_path = Path(str(diagnostic_json_path))
+        image_path = json_path.with_suffix(".png")
+        text_path = json_path.with_suffix(".txt")
+        return json_path, image_path, text_path
+
+    def open_selected_diagnostic_file(self, file_kind: str) -> None:
+        row = self.get_selected_diagnostic_row()
+        json_path, image_path, text_path = self.get_diagnostic_paths(row)
+
+        target_path: Path | None
+        if file_kind == "image":
+            target_path = image_path
+        elif file_kind == "text":
+            target_path = text_path
+        else:
+            target_path = json_path
+
+        if target_path is None or not target_path.exists():
+            QMessageBox.warning(
+                self,
+                "Archivo no disponible",
+                "El archivo seleccionado no existe o aun no se ha generado.",
+            )
+            self.update_diagnostics_actions()
+            return
+
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(target_path.resolve()))):
+            QMessageBox.warning(
+                self,
+                "No se pudo abrir",
+                f"No se pudo abrir {target_path.name}.",
+            )
 
     def show_prompt_dialog(self, request: PromptRequest) -> None:
         text, accepted = QInputDialog.getText(

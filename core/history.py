@@ -241,6 +241,38 @@ class HistoryStore:
             for row in rows
         ]
 
+    def get_recent_diagnostics(self, limit: int = 50) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    site_name,
+                    status,
+                    reward_text,
+                    reward_kind,
+                    diagnostic_json_path,
+                    created_at
+                FROM site_results
+                WHERE diagnostic_json_path IS NOT NULL
+                  AND diagnostic_json_path != ''
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        return [
+            {
+                "site_name": row[0],
+                "status": row[1],
+                "reward_text": row[2],
+                "reward_kind": row[3],
+                "diagnostic_json_path": row[4],
+                "created_at": row[5],
+            }
+            for row in rows
+        ]
+
     def get_last_run_finished_at(self) -> str | None:
         with self._connect() as connection:
             row = connection.execute(
