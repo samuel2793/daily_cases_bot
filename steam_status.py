@@ -20,6 +20,8 @@ class SteamStatusStore:
             "presence_status": None,
             "presence_detail": None,
             "presence_ready": False,
+            "presence_qr_text": None,
+            "presence_qr_url": None,
             "profile_updated_at": None,
             "profile_refreshing": False,
         }
@@ -121,6 +123,8 @@ def update_steam_presence(
     detail: str | None = None,
     *,
     ready: bool | None = None,
+    qr_text: str | None = None,
+    qr_url: str | None = None,
 ) -> None:
     patch: dict[str, Any] = {
         "presence_status": status,
@@ -128,7 +132,21 @@ def update_steam_presence(
     }
     if ready is not None:
         patch["presence_ready"] = ready
+    if qr_text is not None:
+        patch["presence_qr_text"] = qr_text
+    if qr_url is not None:
+        patch["presence_qr_url"] = qr_url
     _store.update(**patch)
+
+
+def reset_steam_presence_boot_state(*, token_detected: bool) -> None:
+    _store.update(
+        presence_status="Detenido",
+        presence_detail="Refresh token detectado" if token_detected else "Servicio parado",
+        presence_ready=False,
+        presence_qr_text=None,
+        presence_qr_url=None,
+    )
 
 
 def get_steam_status_snapshot() -> dict[str, Any]:

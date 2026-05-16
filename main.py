@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -30,6 +31,7 @@ def main() -> None:
         run_cli()
         return
 
+    ensure_steam_presence_npm_dependencies(BASE_DIR)
     run_gui()
 
 
@@ -58,6 +60,45 @@ def run_gui() -> None:
         raise SystemExit(1) from exc
 
     raise SystemExit(launch_app(BASE_DIR))
+
+
+def ensure_steam_presence_npm_dependencies(base_dir: Path) -> None:
+    package_json_path = base_dir / "package.json"
+    if not package_json_path.exists():
+        return
+
+    try:
+        package_payload = json.loads(package_json_path.read_text(encoding="utf-8"))
+    except Exception:
+        print(
+            "No se pudo leer package.json para comprobar las dependencias de Steam Presence.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    dependencies = package_payload.get("dependencies")
+    if not isinstance(dependencies, dict) or not dependencies:
+        return
+
+    node_modules_dir = base_dir / "node_modules"
+    missing_packages: list[str] = []
+    for package_name in dependencies.keys():
+        package_path = node_modules_dir.joinpath(*str(package_name).split("/"))
+        if not package_path.exists():
+            missing_packages.append(str(package_name))
+
+    if not missing_packages:
+        return
+
+    print(
+        "Faltan dependencias npm de Steam Presence. Ejecuta 'npm install' en este directorio antes de abrir la interfaz.",
+        file=sys.stderr,
+    )
+    print(
+        "Paquetes no detectados: " + ", ".join(missing_packages),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":

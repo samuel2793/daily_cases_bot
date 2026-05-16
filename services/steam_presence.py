@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TextIO
 
 from interaction import ask_text
-from steam_status import update_steam_presence
+from steam_status import reset_steam_presence_boot_state, update_steam_presence
 
 
 @dataclass(slots=True)
@@ -29,6 +29,8 @@ class SteamPresenceService:
     )
     input_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     ready_event: threading.Event = field(default_factory=threading.Event, init=False)
+    qr_lines: list[str] = field(default_factory=list, init=False)
+    qr_capture_active: bool = field(default=False, init=False)
 
     def start(self) -> None:
         if self.supervisor_thread is not None and self.supervisor_thread.is_alive():
@@ -38,10 +40,14 @@ class SteamPresenceService:
         self.stop_event.clear()
         self.permanent_failure_detected.clear()
         self.ready_event.clear()
+        self.qr_lines.clear()
+        self.qr_capture_active = False
         update_steam_presence(
             "Iniciando",
             f"Preparando {self.script_path.name}",
             ready=False,
+            qr_text=None,
+            qr_url=None,
         )
         self.supervisor_thread = threading.Thread(
             target=self._supervise,
@@ -87,7 +93,7 @@ class SteamPresenceService:
                 )
                 return
         self.supervisor_thread = None
-        update_steam_presence("Detenido", "Servicio parado", ready=False)
+        reset_steam_presence_boot_state(token_detected=self._refresh_token_file().exists())
 
     def is_running(self) -> bool:
         process = self.process
@@ -98,19 +104,33 @@ class SteamPresenceService:
 
     def wait_until_ready(self, timeout_seconds: float = 180.0) -> bool:
         if self._refresh_token_file().exists():
-            update_steam_presence("Listo", "Refresh token detectado", ready=True)
+            update_steam_presence(
+                "Listo",
+                "Refresh token detectado",
+                ready=True,
+                qr_text=None,
+                qr_url=None,
+            )
             return True
 
         started_at = time.monotonic()
         while time.monotonic() - started_at < timeout_seconds:
             if self.ready_event.wait(timeout=0.25):
-                update_steam_presence("Listo", "Steam Presence conectado", ready=True)
+                update_steam_presence(
+                    "Listo",
+                    "Steam Presence conectado",
+                    ready=True,
+                    qr_text=None,
+                    qr_url=None,
+                )
                 return True
             if self.permanent_failure_detected.is_set():
                 update_steam_presence(
                     "Error",
                     "Error permanente en Steam Presence",
                     ready=False,
+                    qr_text=None,
+                    qr_url=None,
                 )
                 return False
             process = self.process
@@ -120,6 +140,8 @@ class SteamPresenceService:
                     "Listo" if ready else "Detenido",
                     "Refresh token detectado" if ready else "Servicio no disponible",
                     ready=ready,
+                    qr_text=None,
+                    qr_url=None,
                 )
                 return ready
 
@@ -128,6 +150,8 @@ class SteamPresenceService:
             "Listo" if ready else "No listo",
             "Refresh token detectado" if ready else "Esperando conexion",
             ready=ready,
+            qr_text=None,
+            qr_url=None,
         )
         return ready
 
@@ -146,7 +170,9 @@ class SteamPresenceService:
             exit_code = process.wait()
             if self.stop_event.is_set():
                 self.logger.info("Servicio auxiliar de presencia Steam detenido.")
-                update_steam_presence("Detenido", "Servicio parado", ready=False)
+                reset_steam_presence_boot_state(
+                    token_detected=self._refresh_token_file().exists()
+                )
                 return
             if self.permanent_failure_detected.is_set():
                 self.logger.warning(
@@ -157,6 +183,8 @@ class SteamPresenceService:
                     "Error",
                     "Configuracion o autenticacion invalida",
                     ready=False,
+                    qr_text=None,
+                    qr_url=None,
                 )
                 return
 
@@ -169,6 +197,8 @@ class SteamPresenceService:
                 "Reiniciando",
                 f"Ultimo codigo de salida: {exit_code}",
                 ready=False,
+                qr_text=None,
+                qr_url=None,
             )
             time.sleep(self.restart_delay_seconds)
 
@@ -200,6 +230,8 @@ class SteamPresenceService:
             "En ejecucion",
             f"PID {self.process.pid}",
             ready=False,
+            qr_text=None,
+            qr_url=None,
         )
 
         assert self.process.stdout is not None
@@ -230,14 +262,41 @@ class SteamPresenceService:
                     self.logger.info("[steam-presence/%s] %s", stream_name, line)
                     self._provide_steam_guard_code(line)
                     continue
+                if self._is_qr_start_line(line):
+                    self.qr_capture_active = True
+                    self.qr_lines = [line]
+                    update_steam_presence(
+                        "Escanea QR",
+                        "Escanea el QR desde la interfaz con Steam Guard",
+                        ready=False,
+                        qr_text=line,
+                        qr_url=None,
+                    )
+                    self.logger.log(level, "[steam-presence/%s] %s", stream_name, line)
+                    continue
+                if self.qr_capture_active:
+                    self._consume_qr_line(line, level, stream_name)
+                    continue
                 if self._is_ready_signal(line):
                     self.ready_event.set()
-                    update_steam_presence("Listo", "Steam Presence conectado", ready=True)
+                    update_steam_presence(
+                        "Listo",
+                        "Steam Presence conectado",
+                        ready=True,
+                        qr_text=None,
+                        qr_url=None,
+                    )
                 if self._should_suppress_output(line):
                     continue
                 if self._is_permanent_config_error(line):
                     self.permanent_failure_detected.set()
-                    update_steam_presence("Error", line, ready=False)
+                    update_steam_presence(
+                        "Error",
+                        line,
+                        ready=False,
+                        qr_text=None,
+                        qr_url=None,
+                    )
                 self.logger.log(level, "[steam-presence/%s] %s", stream_name, line)
         finally:
             stream.close()
@@ -277,6 +336,26 @@ class SteamPresenceService:
     def _should_suppress_output(self, line: str) -> bool:
         normalized = line.lower()
         return normalized == "conectado" or normalized.startswith("conectado |")
+
+    def _is_qr_start_line(self, line: str) -> bool:
+        normalized = line.lower()
+        return "escanea este qr" in normalized
+
+    def _consume_qr_line(self, line: str, level: int, stream_name: str) -> None:
+        self.qr_lines.append(line)
+        qr_text = "\n".join(self.qr_lines)
+        qr_url = None
+        if line.startswith("https://s.team/q/"):
+            qr_url = line
+            self.qr_capture_active = False
+        update_steam_presence(
+            "Escanea QR",
+            "Escanea el QR desde la interfaz con Steam Guard",
+            ready=False,
+            qr_text=qr_text,
+            qr_url=qr_url,
+        )
+        self.logger.log(level, "[steam-presence/%s] %s", stream_name, line)
 
     def _is_steam_guard_prompt(self, line: str) -> bool:
         return line.startswith("STEAM_GUARD_CODE_REQUIRED:")

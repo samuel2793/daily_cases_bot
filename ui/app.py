@@ -46,6 +46,7 @@ from sites.steam_playtime import SteamPlaytimeMonitor, format_hours_and_minutes
 from steam_status import (
     configure_steam_status_store,
     get_steam_status_snapshot,
+    reset_steam_presence_boot_state,
     set_steam_status_callback,
     update_steam_refreshing,
 )
@@ -320,6 +321,9 @@ class DashboardWindow(QMainWindow):
             script_path=self.paths.steam_presence_script,
             logger=logging.getLogger("daily_cases_bot.steam_presence"),
         )
+        reset_steam_presence_boot_state(
+            token_detected=self.presence_service._refresh_token_file().exists()
+        )
         self.current_run_progress: dict[str, dict[str, str]] = {}
         self.run_history_rows: list[dict[str, object]] = []
         self.all_diagnostic_rows: list[dict[str, object]] = []
@@ -489,6 +493,17 @@ class DashboardWindow(QMainWindow):
         self.presence_script_label.setStyleSheet("color: #333333; font-size: 11px;")
         self.presence_token_label = QLabel("Refresh token: -")
         self.presence_token_label.setStyleSheet("color: #333333; font-size: 11px;")
+        self.presence_qr_hint_label = QLabel("QR de autorizacion")
+        self.presence_qr_hint_label.setStyleSheet("color: #333333; font-size: 11px;")
+        self.presence_qr_output = QPlainTextEdit()
+        self.presence_qr_output.setReadOnly(True)
+        self.presence_qr_output.setMaximumHeight(160)
+        self.presence_qr_output.setStyleSheet(
+            "font-family: 'DejaVu Sans Mono', 'Noto Sans Mono', monospace; font-size: 9px;"
+        )
+        self.presence_qr_link_label = QLabel("")
+        self.presence_qr_link_label.setOpenExternalLinks(True)
+        self.presence_qr_link_label.setStyleSheet("color: #0b57d0; font-size: 11px;")
         presence_buttons_layout = QHBoxLayout()
         self.presence_start_button = QToolButton()
         self.presence_start_button.setToolTip("Iniciar presencia en Steam")
@@ -519,6 +534,9 @@ class DashboardWindow(QMainWindow):
         presence_layout.addWidget(self.presence_detail_label)
         presence_layout.addWidget(self.presence_script_label)
         presence_layout.addWidget(self.presence_token_label)
+        presence_layout.addWidget(self.presence_qr_hint_label)
+        presence_layout.addWidget(self.presence_qr_output)
+        presence_layout.addWidget(self.presence_qr_link_label)
         presence_layout.addLayout(presence_buttons_layout)
         presence_layout.addStretch(1)
         presence_group.setMaximumWidth(220)
@@ -1517,6 +1535,22 @@ class DashboardWindow(QMainWindow):
         self.presence_token_label.setText(
             f"Refresh token: {'Detectado' if token_exists else 'No detectado'}"
         )
+        qr_text = str(steam_status.get("presence_qr_text") or "").strip()
+        qr_url = str(steam_status.get("presence_qr_url") or "").strip()
+        has_qr = bool(qr_text)
+        self.presence_qr_hint_label.setVisible(has_qr)
+        self.presence_qr_output.setVisible(has_qr)
+        self.presence_qr_link_label.setVisible(bool(qr_url))
+        if has_qr:
+            self.presence_qr_output.setPlainText(qr_text)
+        else:
+            self.presence_qr_output.clear()
+        if qr_url:
+            self.presence_qr_link_label.setText(
+                f"<a href=\"{qr_url}\">{qr_url}</a>"
+            )
+        else:
+            self.presence_qr_link_label.clear()
 
     def presence_status_background(self, status_text: str, ready: bool) -> str:
         normalized = status_text.strip().lower()
