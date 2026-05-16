@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import importlib.util
 import json
 import logging
@@ -43,6 +44,7 @@ from steam_status import (
     configure_steam_status_store,
     get_steam_status_snapshot,
     set_steam_status_callback,
+    update_steam_refreshing,
 )
 
 
@@ -246,12 +248,15 @@ class SteamRefreshThread(QThread):
             logger = configure_logging(paths.log_file, extra_handlers=[self.log_handler])
             set_interaction_provider(QtInputProvider(self.prompt_bridge))
             set_steam_status_callback(self.steam_status_updated.emit)
+            update_steam_refreshing(True)
 
             playtime_monitor = SteamPlaytimeMonitor(
                 session_file=paths.steam_session_file,
                 workspace_dir=paths.data_dir,
                 data_file=paths.steam_playtime_file,
                 logger=logging.getLogger("daily_cases_bot.steam"),
+                headless=True,
+                slow_mo_ms=0,
             )
             recent_hours = playtime_monitor.check_recent_hours_once()
 
@@ -259,6 +264,8 @@ class SteamRefreshThread(QThread):
                 session_file=paths.steam_session_file,
                 workspace_dir=paths.data_dir,
                 logger=logging.getLogger("daily_cases_bot.steam"),
+                headless=True,
+                slow_mo_ms=0,
             )
             try:
                 steam_manager.start()
@@ -273,6 +280,7 @@ class SteamRefreshThread(QThread):
         except Exception as exc:
             self.refresh_failed.emit(str(exc))
         finally:
+            update_steam_refreshing(False)
             reset_interaction_provider()
             set_steam_status_callback(None)
 
@@ -424,6 +432,8 @@ class DashboardWindow(QMainWindow):
 
         self.steam_profile_status_label = QLabel("Steam profile")
         self.steam_profile_status_label.setStyleSheet("color: #333333; font-size: 12px;")
+        self.steam_updated_label = QLabel("Actualizado: -")
+        self.steam_updated_label.setStyleSheet("color: #555555; font-size: 11px;")
 
         self.steam_playtime_label = QLabel("-")
         self.steam_playtime_label.setStyleSheet("color: #111111; font-weight: bold;")
@@ -442,6 +452,7 @@ class DashboardWindow(QMainWindow):
 
         steam_info_layout.addLayout(steam_top_layout)
         steam_info_layout.addWidget(self.steam_profile_status_label)
+        steam_info_layout.addWidget(self.steam_updated_label)
         steam_info_layout.addSpacing(4)
         steam_info_layout.addWidget(self.steam_playtime_label)
         steam_info_layout.addSpacing(8)
@@ -1264,6 +1275,12 @@ class DashboardWindow(QMainWindow):
         self.steam_profile_status_label.setText(
             "Steam profile temporal" if (avatar_temporary or profile_temporary) else "Steam profile actual"
         )
+        if bool(steam_status.get("profile_refreshing")):
+            self.steam_updated_label.setText("Actualizando...")
+        else:
+            self.steam_updated_label.setText(
+                f"Actualizado: {self.format_timestamp(steam_status.get('profile_updated_at'))}"
+            )
 
         self.update_presence_panel(steam_status)
 
@@ -1327,6 +1344,15 @@ class DashboardWindow(QMainWindow):
         if normalized in {"iniciando", "en ejecucion", "reiniciando", "no listo"}:
             return "#f4e7a3"
         return "#e9e9e9"
+
+    def format_timestamp(self, iso_value: object) -> str:
+        if not iso_value:
+            return "-"
+        try:
+            updated_at = datetime.fromisoformat(str(iso_value))
+        except Exception:
+            return str(iso_value)
+        return updated_at.strftime("%Y-%m-%d %H:%M:%S")
 
     def normalize_display_name(self, value: str) -> str:
         cleaned_chars: list[str] = []

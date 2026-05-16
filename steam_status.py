@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import threading
 from pathlib import Path
@@ -19,6 +20,8 @@ class SteamStatusStore:
             "presence_status": None,
             "presence_detail": None,
             "presence_ready": False,
+            "profile_updated_at": None,
+            "profile_refreshing": False,
         }
         self._store_file: Path | None = None
         self._callback: Callable[[dict[str, Any]], None] | None = None
@@ -85,6 +88,8 @@ def update_steam_playtime(recent_hours: float, recent_hours_text: str) -> None:
     _store.update(
         recent_hours=recent_hours,
         recent_hours_text=recent_hours_text,
+        profile_updated_at=datetime.now().astimezone().isoformat(),
+        profile_refreshing=False,
     )
 
 
@@ -93,6 +98,8 @@ def update_steam_avatar(image_path: Path | str | None, temporary: bool) -> None:
     _store.update(
         avatar_path=avatar_path,
         avatar_temporary=temporary,
+        profile_updated_at=datetime.now().astimezone().isoformat(),
+        profile_refreshing=False,
     )
 
 
@@ -100,7 +107,13 @@ def update_steam_profile_name(name: str | None, temporary: bool) -> None:
     _store.update(
         profile_name=name,
         profile_name_temporary=temporary,
+        profile_updated_at=datetime.now().astimezone().isoformat(),
+        profile_refreshing=False,
     )
+
+
+def update_steam_refreshing(refreshing: bool) -> None:
+    _store.update(profile_refreshing=refreshing)
 
 
 def update_steam_presence(

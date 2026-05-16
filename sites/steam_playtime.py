@@ -92,12 +92,16 @@ class SteamPlaytimeMonitor:
     logger: logging.Logger
     minimum_hours: float = 5.0
     poll_interval_seconds: int = 300
+    headless: bool = False
+    slow_mo_ms: int = 90
 
     def check_recent_hours_once(self) -> float:
         steam_client = SteamAvatarManager(
             session_file=self.session_file,
             workspace_dir=self.workspace_dir,
             logger=self.logger,
+            headless=self.headless,
+            slow_mo_ms=self.slow_mo_ms,
         )
         steam_client.start()
 
