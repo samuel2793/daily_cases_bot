@@ -150,6 +150,7 @@ class DashboardWindow(QMainWindow):
         self.prompt_bridge = PromptBridge()
         self.runner_thread: RunnerThread | None = None
         self.current_run_progress: dict[str, dict[str, str]] = {}
+        self.run_history_rows: list[dict[str, object]] = []
         self.all_diagnostic_rows: list[dict[str, object]] = []
         self.diagnostic_rows: list[dict[str, object]] = []
         self.cancel_requested_in_ui = False
@@ -303,6 +304,42 @@ class DashboardWindow(QMainWindow):
         dashboard_layout.addWidget(bottom_splitter, stretch=1)
         self.tabs.addTab(dashboard_tab, "Panel")
 
+        history_tab = QWidget()
+        history_layout = QVBoxLayout(history_tab)
+
+        self.runs_table = QTableWidget(0, 9)
+        self.runs_table.setHorizontalHeaderLabels(
+            [
+                "Fecha",
+                "Hora",
+                "Estado run",
+                "Steam",
+                "KeyDrop",
+                "CSGOCases",
+                "BloodyCase",
+                "CS2.free",
+                "Delta",
+            ]
+        )
+        self.runs_table.verticalHeader().setVisible(False)
+        self.runs_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.runs_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.runs_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.runs_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+
+        self.run_detail_label = QLabel(
+            "Selecciona una ejecucion para ver el detalle completo del flujo."
+        )
+        self.run_detail_label.setWordWrap(True)
+
+        self.run_detail_preview = QPlainTextEdit()
+        self.run_detail_preview.setReadOnly(True)
+
+        history_layout.addWidget(self.runs_table, stretch=1)
+        history_layout.addWidget(self.run_detail_label)
+        history_layout.addWidget(self.run_detail_preview, stretch=1)
+        self.tabs.addTab(history_tab, "Historico")
+
         diagnostics_tab = QWidget()
         diagnostics_layout = QVBoxLayout(diagnostics_tab)
 
@@ -362,6 +399,7 @@ class DashboardWindow(QMainWindow):
         self.refresh_button.clicked.connect(self.refresh_dashboard)
         self.log_emitter.message.connect(self.append_log)
         self.prompt_bridge.prompt_requested.connect(self.show_prompt_dialog)
+        self.runs_table.itemSelectionChanged.connect(self.on_run_selection_changed)
         self.diagnostics_table.itemSelectionChanged.connect(
             self.on_diagnostic_selection_changed
         )
@@ -545,6 +583,7 @@ class DashboardWindow(QMainWindow):
                 self.format_amount(row.get("balance_delta")),
             )
 
+        self.refresh_runs_table()
         self.refresh_diagnostics_table()
 
     def refresh_site_table(self, latest_site_rows: dict[str, dict[str, object]]) -> None:
@@ -733,6 +772,122 @@ class DashboardWindow(QMainWindow):
             self.log_output.verticalScrollBar().maximum()
         )
 
+    def refresh_runs_table(self) -> None:
+        previous_row_index = self.runs_table.currentRow()
+        self.run_history_rows = self.history_store.get_recent_runs(40)
+        self.runs_table.setRowCount(len(self.run_history_rows))
+
+        for row_index, run_row in enumerate(self.run_history_rows):
+            site_status_map = {
+                str(site_row.get("site_name") or ""): str(site_row.get("status") or "-")
+                for site_row in list(run_row.get("site_results") or [])
+                if isinstance(site_row, dict)
+            }
+            started_at = str(run_row.get("started_at") or "")
+            self.set_table_item(self.runs_table, row_index, 0, self.extract_date_text(started_at))
+            self.set_table_item(self.runs_table, row_index, 1, self.extract_time_text(started_at))
+            self.set_table_item(
+                self.runs_table,
+                row_index,
+                2,
+                str(run_row.get("run_status") or "-"),
+            )
+            self.set_table_item(
+                self.runs_table,
+                row_index,
+                3,
+                self.format_recent_hours(run_row.get("recent_hours")),
+            )
+            self.set_table_item(
+                self.runs_table,
+                row_index,
+                4,
+                site_status_map.get("keydrop", "-"),
+            )
+            self.set_table_item(
+                self.runs_table,
+                row_index,
+                5,
+                site_status_map.get("csgocases", "-"),
+            )
+            self.set_table_item(
+                self.runs_table,
+                row_index,
+                6,
+                site_status_map.get("bloodycase", "-"),
+            )
+            self.set_table_item(
+                self.runs_table,
+                row_index,
+                7,
+                site_status_map.get("cs2free", "-"),
+            )
+            self.set_table_item(
+                self.runs_table,
+                row_index,
+                8,
+                self.format_amount(run_row.get("positive_delta")),
+            )
+
+        if self.run_history_rows:
+            target_row = previous_row_index if previous_row_index >= 0 else 0
+            target_row = min(target_row, len(self.run_history_rows) - 1)
+            self.runs_table.selectRow(target_row)
+            self.on_run_selection_changed()
+        else:
+            self.run_detail_label.setText(
+                "Aun no hay ejecuciones completas registradas."
+            )
+            self.run_detail_preview.clear()
+
+    def on_run_selection_changed(self) -> None:
+        row_index = self.runs_table.currentRow()
+        if row_index < 0 or row_index >= len(self.run_history_rows):
+            self.run_detail_label.setText(
+                "Selecciona una ejecucion para ver el detalle completo del flujo."
+            )
+            self.run_detail_preview.clear()
+            return
+
+        run_row = self.run_history_rows[row_index]
+        started_at = str(run_row.get("started_at") or "-")
+        finished_at = str(run_row.get("finished_at") or "-")
+        self.run_detail_label.setText(
+            f"Ejecucion del {started_at} | Final: {str(run_row.get('run_status') or '-')}"
+        )
+        self.run_detail_preview.setPlainText(self.build_run_detail_text(run_row))
+
+    def build_run_detail_text(self, run_row: dict[str, object]) -> str:
+        lines = [
+            f"Inicio: {str(run_row.get('started_at') or '-')}",
+            f"Fin: {str(run_row.get('finished_at') or '-')}",
+            f"Estado del flujo: {str(run_row.get('run_status') or '-')}",
+            f"Horas recientes de CS2: {self.format_recent_hours(run_row.get('recent_hours'))}",
+            f"Saldo total detectado: {self.format_amount(run_row.get('total_balance_value'))}",
+            f"Delta positivo del run: {self.format_amount(run_row.get('positive_delta'))}",
+            "",
+            "Sitios:",
+        ]
+
+        site_rows = list(run_row.get("site_results") or [])
+        for site_row in site_rows:
+            if not isinstance(site_row, dict):
+                continue
+            reward_text = str(site_row.get("reward_text") or "-")
+            reward_kind = str(site_row.get("reward_kind") or "")
+            if reward_kind and reward_kind != "unknown" and reward_text != "-":
+                reward_text = f"{reward_text} [{reward_kind}]"
+            lines.extend(
+                [
+                    f"{str(site_row.get('site_name') or '-')}: {str(site_row.get('status') or '-')}",
+                    f"  Recompensa: {reward_text}",
+                    f"  Saldo: {str(site_row.get('balance_text') or '-')}",
+                    f"  Delta: {self.format_amount(site_row.get('balance_delta'))}",
+                ]
+            )
+
+        return "\n".join(lines)
+
     def refresh_diagnostics_table(self) -> None:
         previous_row_index = self.diagnostics_table.currentRow()
         previous_site = self.diagnostic_site_filter.currentText()
@@ -916,6 +1071,27 @@ class DashboardWindow(QMainWindow):
         if len(created_at) >= 10:
             return created_at[:10]
         return created_at or "-"
+
+    def extract_date_text(self, value: str) -> str:
+        text = value.strip()
+        if len(text) >= 10:
+            return text[:10]
+        return text or "-"
+
+    def extract_time_text(self, value: str) -> str:
+        text = value.strip()
+        if len(text) >= 19:
+            return text[11:19]
+        return "-"
+
+    def format_recent_hours(self, value: object) -> str:
+        if value is None:
+            return "-"
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        return f"{numeric_value:.2f} h"
 
     def get_diagnostic_paths(
         self,

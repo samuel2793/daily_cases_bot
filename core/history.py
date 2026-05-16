@@ -273,6 +273,89 @@ class HistoryStore:
             for row in rows
         ]
 
+    def get_recent_runs(self, limit: int = 30) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            run_rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    started_at,
+                    finished_at,
+                    recent_hours,
+                    run_status,
+                    total_balance_value
+                FROM runs
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+            if not run_rows:
+                return []
+
+            run_ids = [int(row[0]) for row in run_rows]
+            placeholders = ",".join("?" for _ in run_ids)
+            site_rows = connection.execute(
+                f"""
+                SELECT
+                    run_id,
+                    site_name,
+                    status,
+                    reward_text,
+                    reward_kind,
+                    balance_text,
+                    balance_value,
+                    balance_delta
+                FROM site_results
+                WHERE run_id IN ({placeholders})
+                ORDER BY id ASC
+                """,
+                tuple(run_ids),
+            ).fetchall()
+
+        site_results_by_run: dict[int, list[dict[str, object]]] = {}
+        for row in site_rows:
+            run_id = int(row[0])
+            site_results_by_run.setdefault(run_id, []).append(
+                {
+                    "site_name": row[1],
+                    "status": row[2],
+                    "reward_text": row[3],
+                    "reward_kind": row[4],
+                    "balance_text": row[5],
+                    "balance_value": row[6],
+                    "balance_delta": row[7],
+                }
+            )
+
+        runs: list[dict[str, object]] = []
+        for row in run_rows:
+            run_id = int(row[0])
+            site_results = site_results_by_run.get(run_id, [])
+            positive_delta = round(
+                sum(
+                    float(site_row["balance_delta"])
+                    for site_row in site_results
+                    if isinstance(site_row.get("balance_delta"), (int, float))
+                    and float(site_row["balance_delta"]) > 0
+                ),
+                2,
+            )
+            runs.append(
+                {
+                    "run_id": run_id,
+                    "started_at": row[1],
+                    "finished_at": row[2],
+                    "recent_hours": row[3],
+                    "run_status": row[4],
+                    "total_balance_value": row[5],
+                    "positive_delta": positive_delta,
+                    "site_results": site_results,
+                }
+            )
+        return runs
+
     def get_last_run_finished_at(self) -> str | None:
         with self._connect() as connection:
             row = connection.execute(
