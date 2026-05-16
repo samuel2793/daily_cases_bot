@@ -1,2 +1,3 @@
 playwright>=1.52,<2
 PySide6>=6.8,<7
+qrcode[pil]>=7,<8

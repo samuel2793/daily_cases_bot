@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import importlib.util
+import io
 import json
 import logging
 import shutil
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -331,6 +333,10 @@ class DashboardWindow(QMainWindow):
         self.cancel_requested_in_ui = False
         self.setup_autofocus_done = False
         self.has_non_ok_setup_status = False
+        self.presence_qr_dialog: QDialog | None = None
+        self.presence_qr_image_label: QLabel | None = None
+        self.presence_qr_dialog_link_label: QLabel | None = None
+        self.presence_qr_last_seen_url: str | None = None
 
         self.setWindowTitle("Daily Cases Bot")
         self.resize(
@@ -495,12 +501,7 @@ class DashboardWindow(QMainWindow):
         self.presence_token_label.setStyleSheet("color: #333333; font-size: 11px;")
         self.presence_qr_hint_label = QLabel("QR de autorizacion")
         self.presence_qr_hint_label.setStyleSheet("color: #333333; font-size: 11px;")
-        self.presence_qr_output = QPlainTextEdit()
-        self.presence_qr_output.setReadOnly(True)
-        self.presence_qr_output.setMaximumHeight(160)
-        self.presence_qr_output.setStyleSheet(
-            "font-family: 'DejaVu Sans Mono', 'Noto Sans Mono', monospace; font-size: 9px;"
-        )
+        self.presence_open_qr_button = QPushButton("Abrir QR")
         self.presence_qr_link_label = QLabel("")
         self.presence_qr_link_label.setOpenExternalLinks(True)
         self.presence_qr_link_label.setStyleSheet("color: #0b57d0; font-size: 11px;")
@@ -535,7 +536,7 @@ class DashboardWindow(QMainWindow):
         presence_layout.addWidget(self.presence_script_label)
         presence_layout.addWidget(self.presence_token_label)
         presence_layout.addWidget(self.presence_qr_hint_label)
-        presence_layout.addWidget(self.presence_qr_output)
+        presence_layout.addWidget(self.presence_open_qr_button)
         presence_layout.addWidget(self.presence_qr_link_label)
         presence_layout.addLayout(presence_buttons_layout)
         presence_layout.addStretch(1)
@@ -849,6 +850,7 @@ class DashboardWindow(QMainWindow):
         self.open_diagnostic_json_button.clicked.connect(
             lambda: self.open_selected_diagnostic_file("json")
         )
+        self.presence_open_qr_button.clicked.connect(self.open_presence_qr_dialog)
         self.save_settings_button.clicked.connect(self.save_settings_from_controls)
         self.reload_settings_button.clicked.connect(self.reload_settings_from_disk)
         self.reset_settings_button.clicked.connect(self.reset_settings_to_defaults)
@@ -1537,20 +1539,112 @@ class DashboardWindow(QMainWindow):
         )
         qr_text = str(steam_status.get("presence_qr_text") or "").strip()
         qr_url = str(steam_status.get("presence_qr_url") or "").strip()
-        has_qr = bool(qr_text)
+        has_qr = bool(qr_text or qr_url)
         self.presence_qr_hint_label.setVisible(has_qr)
-        self.presence_qr_output.setVisible(has_qr)
+        self.presence_open_qr_button.setVisible(has_qr)
         self.presence_qr_link_label.setVisible(bool(qr_url))
-        if has_qr:
-            self.presence_qr_output.setPlainText(qr_text)
-        else:
-            self.presence_qr_output.clear()
         if qr_url:
             self.presence_qr_link_label.setText(
                 f"<a href=\"{qr_url}\">{qr_url}</a>"
             )
+            if qr_url != self.presence_qr_last_seen_url:
+                self.presence_qr_last_seen_url = qr_url
+                self.show_presence_qr_dialog(qr_url)
         else:
             self.presence_qr_link_label.clear()
+            self.presence_qr_last_seen_url = None
+            self.close_presence_qr_dialog()
+
+    def build_presence_qr_dialog(self) -> QDialog:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Autorizar Presencia en Steam")
+        dialog.setModal(False)
+        dialog.resize(420, 520)
+
+        layout = QVBoxLayout(dialog)
+        info_label = QLabel(
+            "Escanea este QR con Steam Guard para autorizar Presencia en Steam."
+        )
+        info_label.setWordWrap(True)
+
+        image_label = QLabel("Generando QR...")
+        image_label.setAlignment(Qt.AlignCenter)
+        image_label.setMinimumHeight(320)
+
+        link_label = QLabel("")
+        link_label.setOpenExternalLinks(True)
+        link_label.setWordWrap(True)
+        link_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+
+        close_button = QPushButton("Cerrar")
+        close_button.clicked.connect(dialog.close)
+
+        layout.addWidget(info_label)
+        layout.addWidget(image_label, stretch=1)
+        layout.addWidget(link_label)
+        layout.addWidget(close_button, alignment=Qt.AlignRight)
+
+        self.presence_qr_image_label = image_label
+        self.presence_qr_dialog_link_label = link_label
+        return dialog
+
+    def show_presence_qr_dialog(self, qr_url: str) -> None:
+        if not qr_url:
+            return
+        if self.presence_qr_dialog is None:
+            self.presence_qr_dialog = self.build_presence_qr_dialog()
+
+        pixmap = self.generate_qr_pixmap(qr_url)
+        if self.presence_qr_image_label is not None:
+            if pixmap is not None and not pixmap.isNull():
+                self.presence_qr_image_label.setPixmap(pixmap)
+                self.presence_qr_image_label.setText("")
+            else:
+                self.presence_qr_image_label.setPixmap(QPixmap())
+                self.presence_qr_image_label.setText("No se pudo generar el QR.")
+        if self.presence_qr_dialog_link_label is not None:
+            self.presence_qr_dialog_link_label.setText(f"<a href=\"{qr_url}\">{qr_url}</a>")
+
+        self.presence_qr_dialog.show()
+        self.presence_qr_dialog.raise_()
+        self.presence_qr_dialog.activateWindow()
+
+    def open_presence_qr_dialog(self) -> None:
+        snapshot = get_steam_status_snapshot()
+        qr_url = str(snapshot.get("presence_qr_url") or "").strip()
+        if not qr_url:
+            QMessageBox.information(
+                self,
+                "QR no disponible",
+                "Ahora mismo no hay ningun QR pendiente de autorizacion.",
+            )
+            return
+        self.show_presence_qr_dialog(qr_url)
+
+    def close_presence_qr_dialog(self) -> None:
+        if self.presence_qr_dialog is None:
+            return
+        self.presence_qr_dialog.close()
+        self.presence_qr_dialog = None
+        self.presence_qr_image_label = None
+        self.presence_qr_dialog_link_label = None
+
+    def generate_qr_pixmap(self, qr_url: str) -> QPixmap | None:
+        try:
+            import qrcode
+        except Exception:
+            return None
+
+        qr = qrcode.QRCode(border=2, box_size=8)
+        qr.add_data(qr_url)
+        qr.make(fit=True)
+        image = qr.make_image(fill_color="black", back_color="white")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(buffer.getvalue(), "PNG"):
+            return None
+        return pixmap
 
     def presence_status_background(self, status_text: str, ready: bool) -> str:
         normalized = status_text.strip().lower()
