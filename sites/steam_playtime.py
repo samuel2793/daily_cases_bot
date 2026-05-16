@@ -10,6 +10,8 @@ from typing import Any
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
+from steam_status import update_steam_playtime
+
 from .steam import STEAM_PROFILE_URL, SteamAvatarManager
 
 STEAM_PROFILE_ENGLISH_URL = f"{STEAM_PROFILE_URL}?l=english"
@@ -109,6 +111,10 @@ class SteamPlaytimeMonitor:
                 game_name=TARGET_GAME_NAME,
                 app_id=TARGET_GAME_APP_ID,
                 logger=self.logger,
+            )
+            update_steam_playtime(
+                recent_hours,
+                format_hours_and_minutes(recent_hours),
             )
             return recent_hours
         finally:

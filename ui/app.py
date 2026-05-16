@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import unicodedata
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QFont
+from PySide6.QtGui import QAction, QColor, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QGridLayout,
@@ -30,6 +31,11 @@ from core.history import HistoryStore
 from core.runner import DailyCasesRunner
 from core.runtime import RuntimePaths, configure_logging, ensure_runtime_dirs
 from interaction import PromptRequest, reset_interaction_provider, set_interaction_provider
+from steam_status import (
+    configure_steam_status_store,
+    get_steam_status_snapshot,
+    set_steam_status_callback,
+)
 
 
 class LogEmitter(QObject):
@@ -84,6 +90,7 @@ class RunnerThread(QThread):
     run_finished = Signal(object)
     run_failed = Signal(str)
     progress_updated = Signal(object)
+    steam_status_updated = Signal(object)
 
     def __init__(
         self,
@@ -100,6 +107,7 @@ class RunnerThread(QThread):
         try:
             paths = RuntimePaths.from_base_dir(self.base_dir)
             ensure_runtime_dirs(paths)
+            configure_steam_status_store(paths.steam_state_file)
             logger = configure_logging(paths.log_file, extra_handlers=[self.log_handler])
             history_store = HistoryStore(paths.db_file)
             history_store.initialize()
@@ -110,12 +118,14 @@ class RunnerThread(QThread):
                 progress_callback=self.progress_updated.emit,
             )
             set_interaction_provider(QtInputProvider(self.prompt_bridge))
+            set_steam_status_callback(self.steam_status_updated.emit)
             summary = runner.run()
             self.run_finished.emit(summary)
         except Exception as exc:
             self.run_failed.emit(str(exc))
         finally:
             reset_interaction_provider()
+            set_steam_status_callback(None)
 
 
 class DashboardWindow(QMainWindow):
@@ -124,6 +134,7 @@ class DashboardWindow(QMainWindow):
         self.base_dir = base_dir.resolve()
         self.paths = RuntimePaths.from_base_dir(self.base_dir)
         ensure_runtime_dirs(self.paths)
+        configure_steam_status_store(self.paths.steam_state_file)
         self.history_store = HistoryStore(self.paths.db_file)
         self.history_store.initialize()
 
@@ -144,6 +155,8 @@ class DashboardWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         root_layout = QVBoxLayout(central_widget)
 
+        header_layout = QHBoxLayout()
+
         summary_group = QGroupBox("Resumen")
         summary_layout = QGridLayout(summary_group)
         self.total_balance_label = self._make_value_label("0,00")
@@ -157,6 +170,51 @@ class DashboardWindow(QMainWindow):
         summary_layout.addWidget(self.today_total_label, 1, 1)
         summary_layout.addWidget(QLabel("Ultima ejecucion"), 2, 0)
         summary_layout.addWidget(self.last_run_label, 2, 1)
+        header_layout.addWidget(summary_group, stretch=2)
+
+        steam_group = QGroupBox("Steam")
+        steam_layout = QHBoxLayout(steam_group)
+        self.steam_avatar_label = QLabel("Sin avatar")
+        self.steam_avatar_label.setAlignment(Qt.AlignCenter)
+        self.steam_avatar_label.setFixedSize(128, 128)
+        self.steam_avatar_label.setStyleSheet(
+            "background-color: #f3f3f3; border: 1px solid #bdbdbd; border-radius: 10px; color: #111111;"
+        )
+        steam_layout.addWidget(self.steam_avatar_label)
+
+        steam_info_layout = QVBoxLayout()
+        self.steam_profile_name_label = QLabel("-")
+        self.steam_profile_name_label.setFont(self._make_name_font())
+        self.steam_profile_name_label.setWordWrap(True)
+        self.steam_profile_name_label.setStyleSheet("color: #111111;")
+
+        self.steam_profile_status_label = QLabel("Steam profile")
+        self.steam_profile_status_label.setStyleSheet("color: #333333; font-size: 12px;")
+
+        self.steam_playtime_label = QLabel("-")
+        self.steam_playtime_label.setStyleSheet("color: #111111; font-weight: bold;")
+
+        badges_layout = QHBoxLayout()
+        self.steam_avatar_status_label = QLabel("Avatar actual")
+        self.steam_avatar_status_label.setAlignment(Qt.AlignCenter)
+        self.steam_avatar_status_label.setStyleSheet(self._steam_badge_style("#2d3f50", "#c7d5e0"))
+        badges_layout.addWidget(self.steam_avatar_status_label)
+
+        self.steam_profile_mode_label = QLabel("Nick actual")
+        self.steam_profile_mode_label.setAlignment(Qt.AlignCenter)
+        self.steam_profile_mode_label.setStyleSheet(self._steam_badge_style("#2d3f50", "#c7d5e0"))
+        badges_layout.addWidget(self.steam_profile_mode_label)
+        badges_layout.addStretch(1)
+
+        steam_info_layout.addWidget(self.steam_profile_name_label)
+        steam_info_layout.addWidget(self.steam_profile_status_label)
+        steam_info_layout.addSpacing(4)
+        steam_info_layout.addWidget(self.steam_playtime_label)
+        steam_info_layout.addSpacing(8)
+        steam_info_layout.addLayout(badges_layout)
+        steam_info_layout.addStretch(1)
+        steam_layout.addLayout(steam_info_layout, stretch=1)
+        header_layout.addWidget(steam_group, stretch=1)
 
         actions_layout = QHBoxLayout()
         self.run_button = QPushButton("Ejecutar flujo completo")
@@ -220,7 +278,7 @@ class DashboardWindow(QMainWindow):
         bottom_splitter.setStretchFactor(0, 1)
         bottom_splitter.setStretchFactor(1, 1)
 
-        root_layout.addWidget(summary_group)
+        root_layout.addLayout(header_layout)
         root_layout.addLayout(actions_layout)
         root_layout.addWidget(top_splitter, stretch=1)
         root_layout.addWidget(bottom_splitter, stretch=1)
@@ -234,6 +292,7 @@ class DashboardWindow(QMainWindow):
         self.refresh_button.clicked.connect(self.refresh_dashboard)
         self.log_emitter.message.connect(self.append_log)
         self.prompt_bridge.prompt_requested.connect(self.show_prompt_dialog)
+        self.update_steam_panel(get_steam_status_snapshot())
 
     def _make_value_label(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -242,6 +301,27 @@ class DashboardWindow(QMainWindow):
         font.setBold(True)
         label.setFont(font)
         return label
+
+    def _make_name_font(self) -> QFont:
+        font = QFont()
+        font.setPointSize(18)
+        font.setBold(True)
+        font.setFamilies(
+            [
+                "Noto Sans Sinhala",
+                "Noto Sans",
+                "DejaVu Sans",
+                "Adwaita Sans",
+                "Sans Serif",
+            ]
+        )
+        return font
+
+    def _steam_badge_style(self, background: str, foreground: str) -> str:
+        return (
+            f"background-color: {background}; color: {foreground}; "
+            "border-radius: 8px; padding: 4px 10px; font-size: 11px; font-weight: bold;"
+        )
 
     def start_run(self) -> None:
         if self.runner_thread is not None and self.runner_thread.isRunning():
@@ -267,6 +347,7 @@ class DashboardWindow(QMainWindow):
         self.runner_thread.run_finished.connect(self.on_run_finished)
         self.runner_thread.run_failed.connect(self.on_run_failed)
         self.runner_thread.progress_updated.connect(self.update_run_progress)
+        self.runner_thread.steam_status_updated.connect(self.update_steam_panel)
         self.runner_thread.finished.connect(self.on_runner_thread_finished)
         self.runner_thread.start()
 
@@ -300,6 +381,7 @@ class DashboardWindow(QMainWindow):
         self.today_total_label.setText(
             self.format_amount(self.history_store.get_today_positive_total())
         )
+        self.update_steam_panel(get_steam_status_snapshot())
 
         last_run = self.history_store.get_last_run_finished_at()
         self.last_run_label.setText(last_run or "Sin ejecuciones registradas")
@@ -452,6 +534,80 @@ class DashboardWindow(QMainWindow):
             if isinstance(value, (int, float)):
                 total += float(value)
         return round(total, 2)
+
+    def update_steam_panel(self, steam_status: object) -> None:
+        if not isinstance(steam_status, dict):
+            return
+
+        self.steam_playtime_label.setText(
+            f"CS2 ultimas 2 semanas: {steam_status.get('recent_hours_text') or '-'}"
+        )
+
+        avatar_temporary = bool(steam_status.get("avatar_temporary"))
+        self.steam_avatar_status_label.setText(
+            "Avatar temporal" if avatar_temporary else "Avatar actual"
+        )
+        self.steam_avatar_status_label.setStyleSheet(
+            self._steam_badge_style(
+                "#cfe8ff" if avatar_temporary else "#e9e9e9",
+                "#111111",
+            )
+        )
+
+        profile_name = self.normalize_display_name(
+            str(steam_status.get("profile_name") or "-")
+        )
+        self.steam_profile_name_label.setText(profile_name or "-")
+        profile_temporary = bool(steam_status.get("profile_name_temporary"))
+        self.steam_profile_mode_label.setText(
+            "Nick temporal" if profile_temporary else "Nick actual"
+        )
+        self.steam_profile_mode_label.setStyleSheet(
+            self._steam_badge_style(
+                "#cfe8ff" if profile_temporary else "#e9e9e9",
+                "#111111",
+            )
+        )
+        self.steam_profile_status_label.setText(
+            "Steam profile temporal" if (avatar_temporary or profile_temporary) else "Steam profile actual"
+        )
+
+        avatar_path_value = steam_status.get("avatar_path")
+        if not avatar_path_value:
+            self.steam_avatar_label.setText("Sin avatar")
+            self.steam_avatar_label.setPixmap(QPixmap())
+            return
+
+        avatar_path = Path(str(avatar_path_value))
+        if not avatar_path.exists():
+            self.steam_avatar_label.setText("Sin avatar")
+            self.steam_avatar_label.setPixmap(QPixmap())
+            return
+
+        pixmap = QPixmap(str(avatar_path))
+        if pixmap.isNull():
+            self.steam_avatar_label.setText("Sin avatar")
+            self.steam_avatar_label.setPixmap(QPixmap())
+            return
+
+        scaled = pixmap.scaled(
+            self.steam_avatar_label.width(),
+            self.steam_avatar_label.height(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self.steam_avatar_label.setText("")
+        self.steam_avatar_label.setPixmap(scaled)
+
+    def normalize_display_name(self, value: str) -> str:
+        cleaned_chars: list[str] = []
+        for char in value:
+            category = unicodedata.category(char)
+            if category == "Cf":
+                continue
+            cleaned_chars.append(char)
+        cleaned = "".join(cleaned_chars).strip()
+        return " ".join(cleaned.split())
 
     def append_log(self, message: str) -> None:
         self.log_output.appendPlainText(message)

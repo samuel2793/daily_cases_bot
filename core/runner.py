@@ -12,6 +12,7 @@ from sites.bloodycase import BloodyCaseSite
 from sites.cs2free import CS2FreeSite
 from sites.csgocases import CSGOCasesSite
 from sites.keydrop import KeyDropSite
+from sites.steam import SteamAvatarManager
 from sites.steam_playtime import SteamPlaytimeMonitor, format_hours_and_minutes
 
 from .history import HistoryStore
@@ -59,6 +60,7 @@ class DailyCasesRunner:
 
         try:
             recent_hours = playtime_monitor.check_recent_hours_once()
+            self.capture_initial_steam_profile_snapshot()
             if recent_hours < playtime_monitor.minimum_hours:
                 self.logger.warning(
                     "Counter-Strike 2 no cumple el requisito: %s / %s en las ultimas 2 semanas. "
@@ -146,6 +148,28 @@ class DailyCasesRunner:
         if self.history_store is not None:
             self.history_store.record_execution(summary)
         return summary
+
+    def capture_initial_steam_profile_snapshot(self) -> None:
+        steam_manager = SteamAvatarManager(
+            session_file=self.paths.steam_session_file,
+            workspace_dir=self.paths.data_dir,
+            logger=logging.getLogger("daily_cases_bot.steam"),
+        )
+        try:
+            steam_manager.start()
+            steam_manager.backup_current_avatar()
+            steam_manager.backup_current_profile_name()
+        except Exception:
+            self.logger.exception(
+                "No se pudo capturar el snapshot inicial del perfil de Steam."
+            )
+        finally:
+            try:
+                steam_manager.close()
+            except Exception:
+                self.logger.exception(
+                    "No se pudo cerrar SteamAvatarManager tras capturar el snapshot inicial de Steam."
+                )
 
     def build_initial_progress_rows(self) -> list[dict[str, str]]:
         return [

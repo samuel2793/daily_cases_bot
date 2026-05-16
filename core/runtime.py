@@ -14,6 +14,7 @@ class RuntimePaths:
     data_dir: Path
     log_file: Path
     db_file: Path
+    steam_state_file: Path
     balances_file: Path
     steam_playtime_file: Path
     steam_presence_script: Path
@@ -40,6 +41,7 @@ class RuntimePaths:
             data_dir=data_dir,
             log_file=logs_dir / "bot.log",
             db_file=data_dir / "app.db",
+            steam_state_file=data_dir / "steam_state.json",
             balances_file=data_dir / "balances.json",
             steam_playtime_file=data_dir / "steam_playtime.json",
             steam_presence_script=base_dir / "cs2.js",

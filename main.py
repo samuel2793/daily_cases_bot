@@ -12,6 +12,7 @@ from core import (
     ensure_runtime_dirs,
 )
 from interaction import reset_interaction_provider
+from steam_status import configure_steam_status_store, set_steam_status_callback
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -36,6 +37,8 @@ def run_cli() -> None:
     reset_interaction_provider()
     paths = RuntimePaths.from_base_dir(BASE_DIR)
     ensure_runtime_dirs(paths)
+    configure_steam_status_store(paths.steam_state_file)
+    set_steam_status_callback(None)
     logger = configure_logging(paths.log_file)
     history_store = HistoryStore(paths.db_file)
     history_store.initialize()

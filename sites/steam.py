@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from interaction import ask_text
+from steam_status import update_steam_avatar, update_steam_profile_name
 
 from playwright.sync_api import (
     Browser,
@@ -157,6 +158,7 @@ class SteamAvatarManager:
         original_avatar = self.backup_current_avatar()
         temporary_avatar = self.download_remote_image(image_url, self.backup_dir / "temporary_avatar")
         self.apply_avatar_from_file(temporary_avatar)
+        update_steam_avatar(temporary_avatar, temporary=True)
         self.logger.info(
             "Avatar temporal aplicado en Steam. Backup original: %s | Temporal: %s",
             original_avatar,
@@ -167,6 +169,7 @@ class SteamAvatarManager:
     def backup_and_apply_from_file(self, image_path: Path) -> Path:
         original_avatar = self.backup_current_avatar()
         self.apply_avatar_from_file(image_path)
+        update_steam_avatar(image_path, temporary=True)
         self.logger.info(
             "Avatar temporal aplicado desde archivo local. Backup original: %s | Temporal: %s",
             original_avatar,
@@ -191,6 +194,7 @@ class SteamAvatarManager:
             return False
 
         self.apply_avatar_from_file(backup_path)
+        update_steam_avatar(backup_path, temporary=False)
         self.logger.info("Avatar original de Steam restaurado desde %s.", backup_path)
         return True
 
@@ -198,6 +202,7 @@ class SteamAvatarManager:
         current_name = self.backup_current_profile_name()
         updated_name = self.build_profile_name_with_suffix(current_name, suffix)
         self.apply_profile_name(updated_name)
+        update_steam_profile_name(updated_name, temporary=True)
         self.logger.info(
             "Nick temporal aplicado en Steam. Original: %s | Temporal: %s",
             current_name,
@@ -217,6 +222,7 @@ class SteamAvatarManager:
             prefix_length=prefix_length,
         )
         self.apply_profile_name(updated_name)
+        update_steam_profile_name(updated_name, temporary=True)
         self.logger.info(
             "Nick temporal corto aplicado en Steam. Original: %s | Temporal: %s",
             current_name,
@@ -241,6 +247,7 @@ class SteamAvatarManager:
             return False
 
         self.apply_profile_name(original_name)
+        update_steam_profile_name(original_name, temporary=False)
         self.logger.info("Nick original de Steam restaurado: %s", original_name)
         return True
 
@@ -256,6 +263,7 @@ class SteamAvatarManager:
             ),
             encoding="utf-8",
         )
+        update_steam_profile_name(current_name, temporary=False)
         self.logger.info("Nick actual de Steam guardado: %s", current_name)
         return current_name
 
@@ -376,6 +384,7 @@ class SteamAvatarManager:
             ),
             encoding="utf-8",
         )
+        update_steam_avatar(backup_path, temporary=False)
         self.logger.info("Avatar actual de Steam guardado en %s.", backup_path)
         return backup_path
 
