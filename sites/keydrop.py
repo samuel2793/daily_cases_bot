@@ -22,6 +22,8 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
+from interaction import ask_text
+
 from .steam import SteamAvatarManager
 
 DEFAULT_URL = "https://key-drop.com/es"
@@ -413,8 +415,9 @@ class KeyDropSite:
         self.logger.warning("No hay sesion valida. Se requiere login manual.")
 
         while True:
-            input(
-                "Haz login manual en la ventana de Chromium y luego pulsa Enter aqui. "
+            ask_text(
+                "Haz login manual en la ventana de Chromium y luego pulsa Enter aqui. ",
+                title="Login manual en KeyDrop",
             )
             self.human_delay(1.5, 2.8)
             self.page.reload(wait_until="domcontentloaded")
@@ -425,8 +428,9 @@ class KeyDropSite:
                 self.logger.info("Login manual detectado y sesion guardada.")
                 return
 
-            answer = input(
-                "No se pudo confirmar el login. Enter para revisar otra vez o 'q' para salir: "
+            answer = ask_text(
+                "No se pudo confirmar el login. Enter para revisar otra vez o 'q' para salir: ",
+                title="Reintento de login en KeyDrop",
             ).strip().lower()
             if answer in {"q", "quit", "exit"}:
                 raise RuntimeError("Login manual cancelado por el usuario.")
@@ -1314,8 +1318,9 @@ class KeyDropSite:
         time.sleep(random.uniform(min_seconds, max_seconds))
 
     def prompt_retry(self) -> bool:
-        answer = input(
-            "El navegador sigue abierto. Pulsa Enter para reintentar o escribe 'q' para salir: "
+        answer = ask_text(
+            "El navegador sigue abierto. Pulsa Enter para reintentar o escribe 'q' para salir: ",
+            title="Reintentar KeyDrop",
         ).strip().lower()
         return answer not in {"q", "quit", "exit"}
 

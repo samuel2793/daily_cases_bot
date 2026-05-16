@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
+from interaction import ask_text
+
 
 @dataclass(slots=True)
 class SteamPresenceService:
@@ -196,8 +198,9 @@ class SteamPresenceService:
         guard_type = line.split(":", 1)[1] if ":" in line else "Steam Guard"
 
         with self.input_lock:
-            code = input(
-                f"Introduce el codigo 2FA de {guard_type} para Steam Presence: "
+            code = ask_text(
+                f"Introduce el codigo 2FA de {guard_type} para Steam Presence: ",
+                title="Steam Guard requerido",
             ).strip()
 
         if not code:

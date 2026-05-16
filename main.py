@@ -5,14 +5,13 @@ import sys
 from pathlib import Path
 
 from core import (
-    ConsoleInputProvider,
     DailyCasesRunner,
     HistoryStore,
-    PatchedInput,
     RuntimePaths,
     configure_logging,
     ensure_runtime_dirs,
 )
+from interaction import reset_interaction_provider
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -34,14 +33,14 @@ def main() -> None:
 
 
 def run_cli() -> None:
+    reset_interaction_provider()
     paths = RuntimePaths.from_base_dir(BASE_DIR)
     ensure_runtime_dirs(paths)
     logger = configure_logging(paths.log_file)
     history_store = HistoryStore(paths.db_file)
     history_store.initialize()
     runner = DailyCasesRunner(paths, logger, history_store=history_store)
-    with PatchedInput(ConsoleInputProvider()):
-        runner.run()
+    runner.run()
 
 
 def run_gui() -> None:

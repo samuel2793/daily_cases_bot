@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal
-from PySide6.QtGui import QAction, QFont
+from PySide6.QtGui import QAction, QColor, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QGridLayout,
@@ -27,9 +27,9 @@ from PySide6.QtWidgets import (
 )
 
 from core.history import HistoryStore
-from core.input import PatchedInput
 from core.runner import DailyCasesRunner
 from core.runtime import RuntimePaths, configure_logging, ensure_runtime_dirs
+from interaction import PromptRequest, reset_interaction_provider, set_interaction_provider
 
 
 class LogEmitter(QObject):
@@ -51,7 +51,7 @@ class QtLogHandler(logging.Handler):
 
 
 class PromptBridge(QObject):
-    prompt_requested = Signal(str)
+    prompt_requested = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -59,11 +59,11 @@ class PromptBridge(QObject):
         self._event = threading.Event()
         self._answer = ""
 
-    def ask(self, prompt: str) -> str:
+    def ask(self, request: PromptRequest) -> str:
         with self._lock:
             self._answer = ""
             self._event.clear()
-            self.prompt_requested.emit(prompt)
+            self.prompt_requested.emit(request)
             self._event.wait()
             return self._answer
 
@@ -76,13 +76,14 @@ class QtInputProvider:
     def __init__(self, bridge: PromptBridge) -> None:
         self.bridge = bridge
 
-    def ask(self, prompt: str) -> str:
-        return self.bridge.ask(prompt)
+    def ask(self, request: PromptRequest) -> str:
+        return self.bridge.ask(request)
 
 
 class RunnerThread(QThread):
     run_finished = Signal(object)
     run_failed = Signal(str)
+    progress_updated = Signal(object)
 
     def __init__(
         self,
@@ -102,12 +103,19 @@ class RunnerThread(QThread):
             logger = configure_logging(paths.log_file, extra_handlers=[self.log_handler])
             history_store = HistoryStore(paths.db_file)
             history_store.initialize()
-            runner = DailyCasesRunner(paths, logger, history_store=history_store)
-            with PatchedInput(QtInputProvider(self.prompt_bridge)):
-                summary = runner.run()
+            runner = DailyCasesRunner(
+                paths,
+                logger,
+                history_store=history_store,
+                progress_callback=self.progress_updated.emit,
+            )
+            set_interaction_provider(QtInputProvider(self.prompt_bridge))
+            summary = runner.run()
             self.run_finished.emit(summary)
         except Exception as exc:
             self.run_failed.emit(str(exc))
+        finally:
+            reset_interaction_provider()
 
 
 class DashboardWindow(QMainWindow):
@@ -123,6 +131,7 @@ class DashboardWindow(QMainWindow):
         self.log_handler = QtLogHandler(self.log_emitter)
         self.prompt_bridge = PromptBridge()
         self.runner_thread: RunnerThread | None = None
+        self.current_run_progress: dict[str, dict[str, str]] = {}
 
         self.setWindowTitle("Daily Cases Bot")
         self.resize(1360, 920)
@@ -245,6 +254,11 @@ class DashboardWindow(QMainWindow):
 
         self.append_log("Iniciando ejecucion desde la interfaz.")
         self.run_button.setEnabled(False)
+        self.current_run_progress = {
+            site_name: {"site_name": site_name, "phase": "Pendiente", "result": "-"}
+            for site_name in ("keydrop", "csgocases", "bloodycase", "cs2free")
+        }
+        self.refresh_dashboard()
         self.runner_thread = RunnerThread(
             self.base_dir,
             self.prompt_bridge,
@@ -252,6 +266,7 @@ class DashboardWindow(QMainWindow):
         )
         self.runner_thread.run_finished.connect(self.on_run_finished)
         self.runner_thread.run_failed.connect(self.on_run_failed)
+        self.runner_thread.progress_updated.connect(self.update_run_progress)
         self.runner_thread.finished.connect(self.on_runner_thread_finished)
         self.runner_thread.start()
 
@@ -270,6 +285,16 @@ class DashboardWindow(QMainWindow):
     def on_runner_thread_finished(self) -> None:
         self.run_button.setEnabled(True)
 
+    def update_run_progress(self, progress_rows: object) -> None:
+        if not isinstance(progress_rows, list):
+            return
+        self.current_run_progress = {
+            str(row.get("site_name")): row
+            for row in progress_rows
+            if isinstance(row, dict)
+        }
+        self.refresh_dashboard()
+
     def refresh_dashboard(self) -> None:
         self.total_balance_label.setText(self.format_amount(self.load_total_balance()))
         self.today_total_label.setText(
@@ -283,36 +308,7 @@ class DashboardWindow(QMainWindow):
             row["site_name"]: row
             for row in self.history_store.get_latest_site_results()
         }
-        ordered_sites = ["keydrop", "csgocases", "bloodycase", "cs2free"]
-        self.site_table.setRowCount(len(ordered_sites))
-        for row_index, site_name in enumerate(ordered_sites):
-            row = latest_site_rows.get(site_name, {})
-            self.set_table_item(self.site_table, row_index, 0, site_name)
-            self.set_table_item(self.site_table, row_index, 1, str(row.get("status", "-")))
-            self.set_table_item(
-                self.site_table,
-                row_index,
-                2,
-                str(row.get("balance_text") or "-"),
-            )
-            self.set_table_item(
-                self.site_table,
-                row_index,
-                3,
-                str(row.get("reward_text") or "-"),
-            )
-            self.set_table_item(
-                self.site_table,
-                row_index,
-                4,
-                str(row.get("reward_kind") or "-"),
-            )
-            self.set_table_item(
-                self.site_table,
-                row_index,
-                5,
-                self.format_amount(row.get("balance_delta")),
-            )
+        self.refresh_site_table(latest_site_rows)
 
         daily_rows = self.history_store.get_daily_totals(30)
         self.daily_table.setRowCount(len(daily_rows))
@@ -358,6 +354,85 @@ class DashboardWindow(QMainWindow):
                 self.format_amount(row.get("balance_delta")),
             )
 
+    def refresh_site_table(self, latest_site_rows: dict[str, dict[str, object]]) -> None:
+        ordered_sites = ["keydrop", "csgocases", "bloodycase", "cs2free"]
+        self.site_table.setRowCount(len(ordered_sites))
+        for row_index, site_name in enumerate(ordered_sites):
+            row = latest_site_rows.get(site_name, {})
+            progress = self.current_run_progress.get(site_name, {})
+
+            status_text = str(row.get("status", "-"))
+            if progress:
+                phase = str(progress.get("phase") or "Pendiente")
+                result = str(progress.get("result") or "-")
+                if phase == "En curso":
+                    status_text = "En curso"
+                elif phase == "Pendiente":
+                    status_text = "Pendiente"
+                elif phase == "Hecho" and result and result != "-":
+                    status_text = result
+
+            self.set_table_item(self.site_table, row_index, 0, site_name)
+            self.set_table_item(self.site_table, row_index, 1, status_text)
+            self.set_table_item(
+                self.site_table,
+                row_index,
+                2,
+                str(row.get("balance_text") or "-"),
+            )
+            self.set_table_item(
+                self.site_table,
+                row_index,
+                3,
+                str(row.get("reward_text") or "-"),
+            )
+            self.set_table_item(
+                self.site_table,
+                row_index,
+                4,
+                str(row.get("reward_kind") or "-"),
+            )
+            self.set_table_item(
+                self.site_table,
+                row_index,
+                5,
+                self.format_amount(row.get("balance_delta")),
+            )
+            self.apply_site_status_color(row_index, progress)
+
+    def apply_site_status_color(
+        self,
+        row_index: int,
+        progress: dict[str, str],
+    ) -> None:
+        status_item = self.site_table.item(row_index, 1)
+        if status_item is None:
+            return
+
+        status_item.setForeground(QColor("#111111"))
+        status_item.setBackground(QColor("#ffffff"))
+
+        if not progress:
+            return
+
+        phase = str(progress.get("phase") or "")
+        if phase == "Pendiente":
+            status_item.setBackground(QColor("#f4e7a3"))
+        elif phase == "En curso":
+            status_item.setBackground(QColor("#9bd1ff"))
+        elif phase == "Hecho":
+            result = str(progress.get("result") or "").strip().lower()
+            if result == "cooldown":
+                status_item.setBackground(QColor("#d9d9d9"))
+            elif result == "opened_sold":
+                status_item.setBackground(QColor("#5fd46b"))
+            elif result == "aborted":
+                status_item.setBackground(QColor("#f28b82"))
+            elif result == "account_setup_required":
+                status_item.setBackground(QColor("#f6c177"))
+            else:
+                status_item.setBackground(QColor("#a9e5b0"))
+
     def load_total_balance(self) -> float:
         if not self.paths.balances_file.exists():
             return 0.0
@@ -384,11 +459,12 @@ class DashboardWindow(QMainWindow):
             self.log_output.verticalScrollBar().maximum()
         )
 
-    def show_prompt_dialog(self, prompt: str) -> None:
+    def show_prompt_dialog(self, request: PromptRequest) -> None:
         text, accepted = QInputDialog.getText(
             self,
-            "Intervencion requerida",
-            prompt,
+            request.title,
+            request.message,
+            text=request.default,
         )
         if not accepted:
             self.prompt_bridge.submit_answer("q")

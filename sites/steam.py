@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from interaction import ask_text
+
 from playwright.sync_api import (
     Browser,
     BrowserContext,
@@ -522,8 +524,9 @@ class SteamAvatarManager:
         self.logger.warning("No hay sesion valida de Steam. Se requiere login manual.")
 
         while True:
-            input(
-                "Haz login manual en Steam en la ventana de Chromium y luego pulsa Enter aqui. "
+            ask_text(
+                "Haz login manual en Steam en la ventana de Chromium y luego pulsa Enter aqui. ",
+                title="Login manual en Steam",
             )
             self.human_delay(1.5, 2.8)
             self.page.goto(STEAM_EDIT_AVATAR_URL, wait_until="domcontentloaded")
@@ -534,8 +537,9 @@ class SteamAvatarManager:
                 self.logger.info("Login manual de Steam detectado y sesion guardada.")
                 return
 
-            answer = input(
-                "No se pudo confirmar el login de Steam. Enter para revisar otra vez o 'q' para salir: "
+            answer = ask_text(
+                "No se pudo confirmar el login de Steam. Enter para revisar otra vez o 'q' para salir: ",
+                title="Reintento de login en Steam",
             ).strip().lower()
             if answer in {"q", "quit", "exit"}:
                 raise RuntimeError("Login manual de Steam cancelado por el usuario.")

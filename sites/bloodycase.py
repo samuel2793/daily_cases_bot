@@ -20,6 +20,8 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
+from interaction import ask_text
+
 from .keydrop import load_session, save_balance_snapshot, save_session
 from .steam import SteamAvatarManager
 
@@ -280,8 +282,9 @@ class BloodyCaseSite:
         self.logger.warning("No hay sesion valida de BloodyCase. Se requiere login manual.")
 
         while True:
-            input(
-                "Haz login manual en BloodyCase en la ventana de Chromium y luego pulsa Enter aqui. "
+            ask_text(
+                "Haz login manual en BloodyCase en la ventana de Chromium y luego pulsa Enter aqui. ",
+                title="Login manual en BloodyCase",
             )
             self.human_delay(1.5, 2.8)
             self.page.goto(self.url, wait_until="domcontentloaded")
@@ -292,8 +295,9 @@ class BloodyCaseSite:
                 self.logger.info("Login manual detectado en BloodyCase y sesion guardada.")
                 return
 
-            answer = input(
-                "No se pudo confirmar el login en BloodyCase. Enter para revisar otra vez o 'q' para salir: "
+            answer = ask_text(
+                "No se pudo confirmar el login en BloodyCase. Enter para revisar otra vez o 'q' para salir: ",
+                title="Reintento de login en BloodyCase",
             ).strip().lower()
             if answer in {"q", "quit", "exit"}:
                 raise RuntimeError("Login manual de BloodyCase cancelado por el usuario.")
@@ -1033,8 +1037,9 @@ class BloodyCaseSite:
         time.sleep(random.uniform(min_seconds, max_seconds))
 
     def prompt_retry(self) -> bool:
-        answer = input(
-            "El navegador de BloodyCase sigue abierto. Pulsa Enter para reintentar o escribe 'q' para salir: "
+        answer = ask_text(
+            "El navegador de BloodyCase sigue abierto. Pulsa Enter para reintentar o escribe 'q' para salir: ",
+            title="Reintentar BloodyCase",
         ).strip().lower()
         return answer not in {"q", "quit", "exit"}
 

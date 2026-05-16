@@ -4,8 +4,9 @@ import json
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from interaction import ask_text
 from services import SteamPresenceService
 from sites.bloodycase import BloodyCaseSite
 from sites.cs2free import CS2FreeSite
@@ -24,10 +25,12 @@ class DailyCasesRunner:
         paths: RuntimePaths,
         logger: logging.Logger,
         history_store: HistoryStore | None = None,
+        progress_callback: Callable[[list[dict[str, str]]], None] | None = None,
     ) -> None:
         self.paths = paths
         self.logger = logger
         self.history_store = history_store
+        self.progress_callback = progress_callback
 
     def run(self) -> ExecutionSummary:
         started_at = datetime.now().astimezone()
@@ -48,6 +51,8 @@ class DailyCasesRunner:
         bloodycase_result = "not_started"
         cs2free_result = "not_started"
         run_status = "completed"
+        progress_rows = self.build_initial_progress_rows()
+        self.emit_progress(progress_rows)
 
         self.logger.info("Comprobando requisito previo de horas recientes en Steam.")
         self.logger.info("Inicializando bot para KeyDrop.")
@@ -70,14 +75,22 @@ class DailyCasesRunner:
                     )
                     run_status = "steam_presence_not_ready"
                 else:
+                    self.mark_site_in_progress(progress_rows, "keydrop")
                     keydrop_result = self.build_keydrop_site().run()
+                    self.mark_site_completed(progress_rows, "keydrop", keydrop_result)
                     self.logger.info("KeyDrop finalizo con estado: %s", keydrop_result)
                     self.logger.info("Inicializando bot para CSGOCases.")
+                    self.mark_site_in_progress(progress_rows, "csgocases")
                     csgocases_result = self.build_csgocases_site().run()
+                    self.mark_site_completed(progress_rows, "csgocases", csgocases_result)
                     self.logger.info("Inicializando bot para BloodyCase.")
+                    self.mark_site_in_progress(progress_rows, "bloodycase")
                     bloodycase_result = self.build_bloodycase_site().run()
+                    self.mark_site_completed(progress_rows, "bloodycase", bloodycase_result)
                     self.logger.info("Inicializando bot para CS2.free.")
+                    self.mark_site_in_progress(progress_rows, "cs2free")
                     cs2free_result = self.build_cs2free_site().run()
+                    self.mark_site_completed(progress_rows, "cs2free", cs2free_result)
         except KeyboardInterrupt:
             run_status = "interrupted"
             self.logger.info("Ejecucion interrumpida por el usuario.")
@@ -85,7 +98,10 @@ class DailyCasesRunner:
             run_status = "failed"
             self.logger.exception("Error no controlado en main.")
             try:
-                input("El proceso sigue vivo. Pulsa Enter para cerrar.")
+                ask_text(
+                    "El proceso sigue vivo. Pulsa Enter para cerrar.",
+                    title="Error en la ejecucion",
+                )
             except KeyboardInterrupt:
                 self.logger.info("Cierre forzado por el usuario.")
         finally:
@@ -95,6 +111,7 @@ class DailyCasesRunner:
                 self.logger.info(
                     "Cierre interrumpido por el usuario mientras se detenia Steam Presence."
                 )
+            self.emit_progress(progress_rows)
             self.logger.info(
                 "Resumen final | Steam: %s | KeyDrop: %s | CSGOCases: %s | BloodyCase: %s | CS2.free: %s",
                 format_hours_and_minutes(recent_hours)
@@ -129,6 +146,44 @@ class DailyCasesRunner:
         if self.history_store is not None:
             self.history_store.record_execution(summary)
         return summary
+
+    def build_initial_progress_rows(self) -> list[dict[str, str]]:
+        return [
+            {"site_name": "keydrop", "phase": "Pendiente", "result": "-"},
+            {"site_name": "csgocases", "phase": "Pendiente", "result": "-"},
+            {"site_name": "bloodycase", "phase": "Pendiente", "result": "-"},
+            {"site_name": "cs2free", "phase": "Pendiente", "result": "-"},
+        ]
+
+    def mark_site_in_progress(
+        self,
+        progress_rows: list[dict[str, str]],
+        site_name: str,
+    ) -> None:
+        for row in progress_rows:
+            if row["site_name"] == site_name:
+                row["phase"] = "En curso"
+                row["result"] = "-"
+                break
+        self.emit_progress(progress_rows)
+
+    def mark_site_completed(
+        self,
+        progress_rows: list[dict[str, str]],
+        site_name: str,
+        result: str,
+    ) -> None:
+        for row in progress_rows:
+            if row["site_name"] == site_name:
+                row["phase"] = "Hecho"
+                row["result"] = result
+                break
+        self.emit_progress(progress_rows)
+
+    def emit_progress(self, progress_rows: list[dict[str, str]]) -> None:
+        if self.progress_callback is None:
+            return
+        self.progress_callback([dict(row) for row in progress_rows])
 
     def build_keydrop_site(self) -> KeyDropSite:
         return KeyDropSite(

@@ -20,6 +20,8 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
+from interaction import ask_text
+
 from .keydrop import load_session, save_session
 
 DEFAULT_URL = "https://cs2.free/free-cases/"
@@ -272,8 +274,9 @@ class CS2FreeSite:
         self.logger.warning("No hay sesion valida de CS2.free. Se requiere login manual.")
 
         while True:
-            input(
-                "Haz login manual en CS2.free en la ventana de Chromium y luego pulsa Enter aqui. "
+            ask_text(
+                "Haz login manual en CS2.free en la ventana de Chromium y luego pulsa Enter aqui. ",
+                title="Login manual en CS2.free",
             )
             self.human_delay(1.5, 2.8)
             self.page.goto(self.url, wait_until="domcontentloaded")
@@ -284,8 +287,9 @@ class CS2FreeSite:
                 self.logger.info("Login manual detectado en CS2.free y sesion guardada.")
                 return
 
-            answer = input(
-                "No se pudo confirmar el login en CS2.free. Enter para revisar otra vez o 'q' para salir: "
+            answer = ask_text(
+                "No se pudo confirmar el login en CS2.free. Enter para revisar otra vez o 'q' para salir: ",
+                title="Reintento de login en CS2.free",
             ).strip().lower()
             if answer in {"q", "quit", "exit"}:
                 raise RuntimeError("Login manual de CS2.free cancelado por el usuario.")
@@ -870,8 +874,9 @@ class CS2FreeSite:
         time.sleep(random.uniform(min_seconds, max_seconds))
 
     def prompt_retry(self) -> bool:
-        answer = input(
-            "El navegador de CS2.free sigue abierto. Pulsa Enter para reintentar o escribe 'q' para salir: "
+        answer = ask_text(
+            "El navegador de CS2.free sigue abierto. Pulsa Enter para reintentar o escribe 'q' para salir: ",
+            title="Reintentar CS2.free",
         ).strip().lower()
         return answer not in {"q", "quit", "exit"}
 

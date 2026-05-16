@@ -17,6 +17,8 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
+from interaction import ask_text
+
 from .keydrop import load_session, save_balance_snapshot
 from .steam import SteamAvatarManager
 
@@ -49,6 +51,8 @@ class CSGOCasesSite:
     def run(self) -> str:
         avatar_manager: SteamAvatarManager | None = None
         nickname_manager: SteamAvatarManager | None = None
+        completed_manual_cases = 0
+        cooldown_cases = 0
 
         try:
             self.capture_initial_balance_before_cases()
@@ -70,7 +74,9 @@ class CSGOCasesSite:
                     case_label="Caja gratis 2 de CSGOCases",
                     source_url=DAILY_FREE_CASE_URL_ES,
                 )
+                completed_manual_cases += 1
             else:
+                cooldown_cases += 1
                 self.logger.info(
                     "Se omite %s porque CSGOCases la muestra en cooldown.",
                     "Caja gratis 2 de CSGOCases",
@@ -93,7 +99,9 @@ class CSGOCasesSite:
                     case_label="Caja gratis de CSGOCases",
                     source_url=FREE_NICK_CASE_URL_ES,
                 )
+                completed_manual_cases += 1
             else:
+                cooldown_cases += 1
                 self.logger.info(
                     "Se omite %s porque CSGOCases la muestra en cooldown.",
                     "Caja gratis de CSGOCases",
@@ -104,7 +112,13 @@ class CSGOCasesSite:
                 DAILY_FREE_CASE_URL_ES,
                 FREE_NICK_CASE_URL_ES,
             )
-            return "manual_completed"
+            if cooldown_cases == 2:
+                return "cooldown"
+            if completed_manual_cases == 2:
+                return "manual_completed"
+            if completed_manual_cases == 1:
+                return "manual_partial"
+            return "not_available"
         except ManualFlowAborted as exc:
             self.logger.warning("%s", exc)
             return "manual_cancelled"
@@ -126,9 +140,10 @@ class CSGOCasesSite:
         self.logger.info("URL manual de %s: %s", case_label, target_url)
 
         try:
-            answer = input(
+            answer = ask_text(
                 f"Abre manualmente '{case_label}' fuera del navegador automatizado, resuelve todo y cuando termines pulsa Enter para continuar. "
-                "Escribe 'q' para cancelar y restaurar el cambio temporal de Steam: "
+                "Escribe 'q' para cancelar y restaurar el cambio temporal de Steam: ",
+                title=f"Intervencion manual en {case_label}",
             ).strip().lower()
         except KeyboardInterrupt as exc:
             raise ManualFlowAborted(
@@ -538,9 +553,10 @@ class CSGOCasesSite:
         return self.compact_text(str(balance_text))
 
     def prompt_manual_balance(self, case_label: str) -> str | None:
-        answer = input(
+        answer = ask_text(
             f"No se pudo leer automaticamente el saldo de CSGOCases tras '{case_label}'. "
-            "Si quieres registrarlo, pega aqui el saldo actual mostrado en la web (por ejemplo $1.19) o pulsa Enter para omitir: "
+            "Si quieres registrarlo, pega aqui el saldo actual mostrado en la web (por ejemplo $1.19) o pulsa Enter para omitir: ",
+            title="Saldo manual de CSGOCases",
         ).strip()
         return answer or None
 
