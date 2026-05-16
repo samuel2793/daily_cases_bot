@@ -34,12 +34,14 @@ class DailyCasesRunner:
         history_store: HistoryStore | None = None,
         progress_callback: Callable[[list[dict[str, str]]], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
+        steam_presence_service: SteamPresenceService | None = None,
     ) -> None:
         self.paths = paths
         self.logger = logger
         self.history_store = history_store
         self.progress_callback = progress_callback
         self.cancel_requested = cancel_requested
+        self.steam_presence_service = steam_presence_service
 
     def run(self) -> ExecutionSummary:
         started_at = datetime.now().astimezone()
@@ -49,10 +51,11 @@ class DailyCasesRunner:
             data_file=self.paths.steam_playtime_file,
             logger=logging.getLogger("daily_cases_bot.steam"),
         )
-        steam_presence = SteamPresenceService(
+        steam_presence = self.steam_presence_service or SteamPresenceService(
             script_path=self.paths.steam_presence_script,
             logger=logging.getLogger("daily_cases_bot.steam_presence"),
         )
+        presence_started_by_runner = False
 
         recent_hours: float | None = None
         keydrop_result = "not_started"
@@ -81,7 +84,9 @@ class DailyCasesRunner:
                 )
                 run_status = "blocked_by_steam_hours"
             else:
-                steam_presence.start()
+                if not steam_presence.is_running():
+                    steam_presence.start()
+                    presence_started_by_runner = True
                 if not steam_presence.wait_until_ready():
                     self.logger.warning(
                         "Steam Presence no quedo listo. Revisa el login/2FA y vuelve a ejecutar."
@@ -145,7 +150,8 @@ class DailyCasesRunner:
                 self.logger.info("Cierre forzado por el usuario.")
         finally:
             try:
-                steam_presence.stop()
+                if presence_started_by_runner:
+                    steam_presence.stop()
             except KeyboardInterrupt:
                 self.logger.info(
                     "Cierre interrumpido por el usuario mientras se detenia Steam Presence."

@@ -16,6 +16,9 @@ class SteamStatusStore:
             "avatar_temporary": False,
             "profile_name": None,
             "profile_name_temporary": False,
+            "presence_status": None,
+            "presence_detail": None,
+            "presence_ready": False,
         }
         self._store_file: Path | None = None
         self._callback: Callable[[dict[str, Any]], None] | None = None
@@ -98,6 +101,21 @@ def update_steam_profile_name(name: str | None, temporary: bool) -> None:
         profile_name=name,
         profile_name_temporary=temporary,
     )
+
+
+def update_steam_presence(
+    status: str | None,
+    detail: str | None = None,
+    *,
+    ready: bool | None = None,
+) -> None:
+    patch: dict[str, Any] = {
+        "presence_status": status,
+        "presence_detail": detail,
+    }
+    if ready is not None:
+        patch["presence_ready"] = ready
+    _store.update(**patch)
 
 
 def get_steam_status_snapshot() -> dict[str, Any]:

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TextIO
 
 from interaction import ask_text
+from steam_status import update_steam_presence
 
 
 @dataclass(slots=True)
@@ -37,6 +38,11 @@ class SteamPresenceService:
         self.stop_event.clear()
         self.permanent_failure_detected.clear()
         self.ready_event.clear()
+        update_steam_presence(
+            "Iniciando",
+            f"Preparando {self.script_path.name}",
+            ready=False,
+        )
         self.supervisor_thread = threading.Thread(
             target=self._supervise,
             name="steam-presence-supervisor",
@@ -44,6 +50,10 @@ class SteamPresenceService:
         )
         self.supervisor_thread.start()
         self.logger.info("Supervisor del servicio auxiliar de presencia Steam iniciado.")
+
+    def restart(self) -> None:
+        self.stop()
+        self.start()
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -77,22 +87,49 @@ class SteamPresenceService:
                 )
                 return
         self.supervisor_thread = None
+        update_steam_presence("Detenido", "Servicio parado", ready=False)
+
+    def is_running(self) -> bool:
+        process = self.process
+        if process is not None and process.poll() is None:
+            return True
+        thread = self.supervisor_thread
+        return thread is not None and thread.is_alive()
 
     def wait_until_ready(self, timeout_seconds: float = 180.0) -> bool:
         if self._refresh_token_file().exists():
+            update_steam_presence("Listo", "Refresh token detectado", ready=True)
             return True
 
         started_at = time.monotonic()
         while time.monotonic() - started_at < timeout_seconds:
             if self.ready_event.wait(timeout=0.25):
+                update_steam_presence("Listo", "Steam Presence conectado", ready=True)
                 return True
             if self.permanent_failure_detected.is_set():
+                update_steam_presence(
+                    "Error",
+                    "Error permanente en Steam Presence",
+                    ready=False,
+                )
                 return False
             process = self.process
             if process is not None and process.poll() is not None:
-                return self._refresh_token_file().exists()
+                ready = self._refresh_token_file().exists()
+                update_steam_presence(
+                    "Listo" if ready else "Detenido",
+                    "Refresh token detectado" if ready else "Servicio no disponible",
+                    ready=ready,
+                )
+                return ready
 
-        return self._refresh_token_file().exists()
+        ready = self._refresh_token_file().exists()
+        update_steam_presence(
+            "Listo" if ready else "No listo",
+            "Refresh token detectado" if ready else "Esperando conexion",
+            ready=ready,
+        )
+        return ready
 
     def _supervise(self) -> None:
         while not self.stop_event.is_set():
@@ -109,11 +146,17 @@ class SteamPresenceService:
             exit_code = process.wait()
             if self.stop_event.is_set():
                 self.logger.info("Servicio auxiliar de presencia Steam detenido.")
+                update_steam_presence("Detenido", "Servicio parado", ready=False)
                 return
             if self.permanent_failure_detected.is_set():
                 self.logger.warning(
                     "El servicio auxiliar de presencia Steam no se reiniciara automaticamente "
                     "hasta corregir el problema actual."
+                )
+                update_steam_presence(
+                    "Error",
+                    "Configuracion o autenticacion invalida",
+                    ready=False,
                 )
                 return
 
@@ -121,6 +164,11 @@ class SteamPresenceService:
                 "El servicio auxiliar de presencia Steam finalizo con codigo %s. Reintentando en %.1f s.",
                 exit_code,
                 self.restart_delay_seconds,
+            )
+            update_steam_presence(
+                "Reiniciando",
+                f"Ultimo codigo de salida: {exit_code}",
+                ready=False,
             )
             time.sleep(self.restart_delay_seconds)
 
@@ -147,6 +195,11 @@ class SteamPresenceService:
         self.logger.info(
             "Servicio auxiliar de presencia Steam iniciado con PID %s.",
             self.process.pid,
+        )
+        update_steam_presence(
+            "En ejecucion",
+            f"PID {self.process.pid}",
+            ready=False,
         )
 
         assert self.process.stdout is not None
@@ -179,10 +232,12 @@ class SteamPresenceService:
                     continue
                 if self._is_ready_signal(line):
                     self.ready_event.set()
+                    update_steam_presence("Listo", "Steam Presence conectado", ready=True)
                 if self._should_suppress_output(line):
                     continue
                 if self._is_permanent_config_error(line):
                     self.permanent_failure_detected.set()
+                    update_steam_presence("Error", line, ready=False)
                 self.logger.log(level, "[steam-presence/%s] %s", stream_name, line)
         finally:
             stream.close()
@@ -208,6 +263,7 @@ class SteamPresenceService:
             self.logger.warning(
                 "No se introdujo codigo 2FA para Steam Presence. El servicio auxiliar no se reiniciara."
             )
+            update_steam_presence("Error", "Codigo 2FA no introducido", ready=False)
             process.terminate()
             return
 

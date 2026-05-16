@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -35,6 +36,9 @@ from core.history import HistoryStore
 from core.runner import DailyCasesRunner
 from core.runtime import RuntimePaths, configure_logging, ensure_runtime_dirs
 from interaction import PromptRequest, reset_interaction_provider, set_interaction_provider
+from services import SteamPresenceService
+from sites.steam import SteamAvatarManager
+from sites.steam_playtime import SteamPlaytimeMonitor, format_hours_and_minutes
 from steam_status import (
     configure_steam_status_store,
     get_steam_status_snapshot,
@@ -101,11 +105,13 @@ class RunnerThread(QThread):
         base_dir: Path,
         prompt_bridge: PromptBridge,
         log_handler: logging.Handler,
+        presence_service: SteamPresenceService,
     ) -> None:
         super().__init__()
         self.base_dir = base_dir
         self.prompt_bridge = prompt_bridge
         self.log_handler = log_handler
+        self.presence_service = presence_service
         self._cancel_requested = threading.Event()
 
     def request_cancel(self) -> None:
@@ -125,6 +131,7 @@ class RunnerThread(QThread):
                 history_store=history_store,
                 progress_callback=self.progress_updated.emit,
                 cancel_requested=self._cancel_requested.is_set,
+                steam_presence_service=self.presence_service,
             )
             set_interaction_provider(QtInputProvider(self.prompt_bridge))
             set_steam_status_callback(self.steam_status_updated.emit)
@@ -176,6 +183,100 @@ class PreparationThread(QThread):
             set_steam_status_callback(None)
 
 
+class PresenceCommandThread(QThread):
+    command_finished = Signal(str)
+    command_failed = Signal(str)
+
+    def __init__(
+        self,
+        prompt_bridge: PromptBridge,
+        service: SteamPresenceService,
+        action: str,
+    ) -> None:
+        super().__init__()
+        self.prompt_bridge = prompt_bridge
+        self.service = service
+        self.action = action
+
+    def run(self) -> None:
+        try:
+            set_interaction_provider(QtInputProvider(self.prompt_bridge))
+            if self.action == "start":
+                self.service.start()
+                self.service.wait_until_ready(timeout_seconds=15.0)
+                self.command_finished.emit("Servicio de presencia iniciado.")
+                return
+            if self.action == "stop":
+                self.service.stop()
+                self.command_finished.emit("Servicio de presencia detenido.")
+                return
+            if self.action == "restart":
+                self.service.restart()
+                self.service.wait_until_ready(timeout_seconds=15.0)
+                self.command_finished.emit("Servicio de presencia reiniciado.")
+                return
+            raise ValueError(f"Accion no soportada: {self.action}")
+        except Exception as exc:
+            self.command_failed.emit(str(exc))
+        finally:
+            reset_interaction_provider()
+
+
+class SteamRefreshThread(QThread):
+    refresh_finished = Signal(str)
+    refresh_failed = Signal(str)
+    steam_status_updated = Signal(object)
+
+    def __init__(
+        self,
+        base_dir: Path,
+        prompt_bridge: PromptBridge,
+        log_handler: logging.Handler,
+    ) -> None:
+        super().__init__()
+        self.base_dir = base_dir
+        self.prompt_bridge = prompt_bridge
+        self.log_handler = log_handler
+
+    def run(self) -> None:
+        try:
+            paths = RuntimePaths.from_base_dir(self.base_dir)
+            ensure_runtime_dirs(paths)
+            configure_steam_status_store(paths.steam_state_file)
+            logger = configure_logging(paths.log_file, extra_handlers=[self.log_handler])
+            set_interaction_provider(QtInputProvider(self.prompt_bridge))
+            set_steam_status_callback(self.steam_status_updated.emit)
+
+            playtime_monitor = SteamPlaytimeMonitor(
+                session_file=paths.steam_session_file,
+                workspace_dir=paths.data_dir,
+                data_file=paths.steam_playtime_file,
+                logger=logging.getLogger("daily_cases_bot.steam"),
+            )
+            recent_hours = playtime_monitor.check_recent_hours_once()
+
+            steam_manager = SteamAvatarManager(
+                session_file=paths.steam_session_file,
+                workspace_dir=paths.data_dir,
+                logger=logging.getLogger("daily_cases_bot.steam"),
+            )
+            try:
+                steam_manager.start()
+                steam_manager.backup_current_avatar()
+                steam_manager.backup_current_profile_name()
+            finally:
+                steam_manager.close()
+
+            self.refresh_finished.emit(
+                f"Perfil de Steam actualizado. CS2: {format_hours_and_minutes(recent_hours)}"
+            )
+        except Exception as exc:
+            self.refresh_failed.emit(str(exc))
+        finally:
+            reset_interaction_provider()
+            set_steam_status_callback(None)
+
+
 class DashboardWindow(QMainWindow):
     def __init__(self, base_dir: Path) -> None:
         super().__init__()
@@ -188,9 +289,19 @@ class DashboardWindow(QMainWindow):
 
         self.log_emitter = LogEmitter()
         self.log_handler = QtLogHandler(self.log_emitter)
+        self.app_logger = configure_logging(
+            self.paths.log_file,
+            extra_handlers=[self.log_handler],
+        )
         self.prompt_bridge = PromptBridge()
         self.runner_thread: RunnerThread | None = None
         self.preparation_thread: PreparationThread | None = None
+        self.presence_thread: PresenceCommandThread | None = None
+        self.steam_refresh_thread: SteamRefreshThread | None = None
+        self.presence_service = SteamPresenceService(
+            script_path=self.paths.steam_presence_script,
+            logger=logging.getLogger("daily_cases_bot.steam_presence"),
+        )
         self.current_run_progress: dict[str, dict[str, str]] = {}
         self.run_history_rows: list[dict[str, object]] = []
         self.all_diagnostic_rows: list[dict[str, object]] = []
@@ -297,10 +408,19 @@ class DashboardWindow(QMainWindow):
         steam_layout.addWidget(self.steam_avatar_label)
 
         steam_info_layout = QVBoxLayout()
+        steam_top_layout = QHBoxLayout()
         self.steam_profile_name_label = QLabel("-")
         self.steam_profile_name_label.setFont(self._make_name_font())
         self.steam_profile_name_label.setWordWrap(True)
         self.steam_profile_name_label.setStyleSheet("color: #111111;")
+        self.steam_refresh_button = QToolButton()
+        self.steam_refresh_button.setToolTip("Actualizar perfil de Steam")
+        self.steam_refresh_button.setAutoRaise(True)
+        self.steam_refresh_button.setIcon(
+            self.style().standardIcon(self.style().StandardPixmap.SP_BrowserReload)
+        )
+        steam_top_layout.addWidget(self.steam_profile_name_label, stretch=1)
+        steam_top_layout.addWidget(self.steam_refresh_button)
 
         self.steam_profile_status_label = QLabel("Steam profile")
         self.steam_profile_status_label.setStyleSheet("color: #333333; font-size: 12px;")
@@ -320,7 +440,7 @@ class DashboardWindow(QMainWindow):
         badges_layout.addWidget(self.steam_profile_mode_label)
         badges_layout.addStretch(1)
 
-        steam_info_layout.addWidget(self.steam_profile_name_label)
+        steam_info_layout.addLayout(steam_top_layout)
         steam_info_layout.addWidget(self.steam_profile_status_label)
         steam_info_layout.addSpacing(4)
         steam_info_layout.addWidget(self.steam_playtime_label)
@@ -329,6 +449,32 @@ class DashboardWindow(QMainWindow):
         steam_info_layout.addStretch(1)
         steam_layout.addLayout(steam_info_layout, stretch=1)
         header_layout.addWidget(steam_group, stretch=1)
+
+        presence_group = QGroupBox("Presencia en Steam")
+        presence_layout = QVBoxLayout(presence_group)
+        self.presence_status_label = QLabel("No iniciado")
+        self.presence_status_label.setAlignment(Qt.AlignCenter)
+        self.presence_status_label.setStyleSheet(
+            self._steam_badge_style("#e9e9e9", "#111111")
+        )
+        self.presence_detail_label = QLabel("-")
+        self.presence_detail_label.setWordWrap(True)
+        self.presence_script_label = QLabel("Script: -")
+        self.presence_token_label = QLabel("Refresh token: -")
+        presence_buttons_layout = QHBoxLayout()
+        self.presence_start_button = QPushButton("Iniciar")
+        self.presence_stop_button = QPushButton("Parar")
+        self.presence_restart_button = QPushButton("Reiniciar")
+        presence_buttons_layout.addWidget(self.presence_start_button)
+        presence_buttons_layout.addWidget(self.presence_stop_button)
+        presence_buttons_layout.addWidget(self.presence_restart_button)
+        presence_layout.addWidget(self.presence_status_label)
+        presence_layout.addWidget(self.presence_detail_label)
+        presence_layout.addWidget(self.presence_script_label)
+        presence_layout.addWidget(self.presence_token_label)
+        presence_layout.addLayout(presence_buttons_layout)
+        presence_layout.addStretch(1)
+        header_layout.addWidget(presence_group, stretch=1)
 
         actions_layout = QHBoxLayout()
         self.run_button = QPushButton("Ejecutar flujo completo")
@@ -501,6 +647,16 @@ class DashboardWindow(QMainWindow):
         self.prepare_csgocases_button.clicked.connect(lambda: self.start_preparation("csgocases"))
         self.prepare_bloodycase_button.clicked.connect(lambda: self.start_preparation("bloodycase"))
         self.prepare_cs2free_button.clicked.connect(lambda: self.start_preparation("cs2free"))
+        self.steam_refresh_button.clicked.connect(self.start_steam_refresh)
+        self.presence_start_button.clicked.connect(
+            lambda: self.start_presence_command("start")
+        )
+        self.presence_stop_button.clicked.connect(
+            lambda: self.start_presence_command("stop")
+        )
+        self.presence_restart_button.clicked.connect(
+            lambda: self.start_presence_command("restart")
+        )
         self.open_sessions_dir_button.clicked.connect(
             lambda: self.open_local_path(self.paths.sessions_dir)
         )
@@ -579,6 +735,20 @@ class DashboardWindow(QMainWindow):
                 "Ya hay una preparacion de sesiones en curso.",
             )
             return
+        if self.presence_thread is not None and self.presence_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Accion en curso",
+                "Espera a que termine la accion sobre Presencia en Steam.",
+            )
+            return
+        if self.steam_refresh_thread is not None and self.steam_refresh_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Actualizacion en curso",
+                "Espera a que termine la actualizacion del perfil de Steam.",
+            )
+            return
 
         self.append_log("Iniciando ejecucion desde la interfaz.")
         self.run_button.setEnabled(False)
@@ -594,6 +764,7 @@ class DashboardWindow(QMainWindow):
             self.base_dir,
             self.prompt_bridge,
             self.log_handler,
+            self.presence_service,
         )
         self.runner_thread.run_finished.connect(self.on_run_finished)
         self.runner_thread.run_failed.connect(self.on_run_failed)
@@ -617,6 +788,20 @@ class DashboardWindow(QMainWindow):
                 "Ya hay una preparacion de sesiones en curso.",
             )
             return
+        if self.presence_thread is not None and self.presence_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Accion en curso",
+                "Espera a que termine la accion sobre Presencia en Steam.",
+            )
+            return
+        if self.steam_refresh_thread is not None and self.steam_refresh_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Actualizacion en curso",
+                "Espera a que termine la actualizacion del perfil de Steam.",
+            )
+            return
 
         target_label = "todas las sesiones" if target == "all" else target
         self.append_log(f"Iniciando preparacion de {target_label} desde la interfaz.")
@@ -634,6 +819,96 @@ class DashboardWindow(QMainWindow):
         self.preparation_thread.steam_status_updated.connect(self.update_steam_panel)
         self.preparation_thread.finished.connect(self.on_preparation_thread_finished)
         self.preparation_thread.start()
+
+    def start_presence_command(self, action: str) -> None:
+        if self.runner_thread is not None and self.runner_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Ejecucion en curso",
+                "No se puede cambiar Presencia en Steam mientras el flujo completo esta en marcha.",
+            )
+            return
+        if self.preparation_thread is not None and self.preparation_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Preparacion en curso",
+                "Espera a que termine la preparacion actual.",
+            )
+            return
+        if self.presence_thread is not None and self.presence_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Accion en curso",
+                "Ya hay una accion en curso sobre Presencia en Steam.",
+            )
+            return
+        if self.steam_refresh_thread is not None and self.steam_refresh_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Actualizacion en curso",
+                "Espera a que termine la actualizacion del perfil de Steam.",
+            )
+            return
+
+        action_label = {
+            "start": "inicio",
+            "stop": "parada",
+            "restart": "reinicio",
+        }.get(action, action)
+        self.append_log(f"Iniciando accion de {action_label} de Presencia en Steam.")
+        self.set_presence_buttons_enabled(False)
+        self.presence_thread = PresenceCommandThread(
+            self.prompt_bridge,
+            self.presence_service,
+            action,
+        )
+        self.presence_thread.command_finished.connect(self.on_presence_command_finished)
+        self.presence_thread.command_failed.connect(self.on_presence_command_failed)
+        self.presence_thread.finished.connect(self.on_presence_command_thread_finished)
+        self.presence_thread.start()
+
+    def start_steam_refresh(self) -> None:
+        if self.runner_thread is not None and self.runner_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Ejecucion en curso",
+                "No se puede refrescar Steam mientras el flujo completo esta en marcha.",
+            )
+            return
+        if self.preparation_thread is not None and self.preparation_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Preparacion en curso",
+                "Espera a que termine la preparacion actual.",
+            )
+            return
+        if self.presence_thread is not None and self.presence_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Accion en curso",
+                "Espera a que termine la accion sobre Presencia en Steam.",
+            )
+            return
+        if self.steam_refresh_thread is not None and self.steam_refresh_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Actualizacion en curso",
+                "Ya hay una actualizacion del perfil de Steam en marcha.",
+            )
+            return
+
+        self.append_log("Actualizando perfil de Steam desde la interfaz.")
+        self.steam_refresh_button.setEnabled(False)
+        self.steam_refresh_thread = SteamRefreshThread(
+            self.base_dir,
+            self.prompt_bridge,
+            self.log_handler,
+        )
+        self.steam_refresh_thread.refresh_finished.connect(self.on_steam_refresh_finished)
+        self.steam_refresh_thread.refresh_failed.connect(self.on_steam_refresh_failed)
+        self.steam_refresh_thread.steam_status_updated.connect(self.update_steam_panel)
+        self.steam_refresh_thread.finished.connect(self.on_steam_refresh_thread_finished)
+        self.steam_refresh_thread.start()
 
     def cancel_run(self) -> None:
         if self.runner_thread is None or not self.runner_thread.isRunning():
@@ -686,6 +961,38 @@ class DashboardWindow(QMainWindow):
     def on_preparation_thread_finished(self) -> None:
         self.set_preparation_buttons_enabled(True)
         self.preparation_thread = None
+
+    def on_presence_command_finished(self, message: str) -> None:
+        self.append_log(message)
+        self.refresh_dashboard()
+
+    def on_presence_command_failed(self, error_message: str) -> None:
+        self.append_log(f"Error en Presencia en Steam: {error_message}")
+        QMessageBox.critical(
+            self,
+            "Error en Presencia en Steam",
+            error_message or "La accion sobre Presencia en Steam ha fallado.",
+        )
+
+    def on_presence_command_thread_finished(self) -> None:
+        self.set_presence_buttons_enabled(True)
+        self.presence_thread = None
+
+    def on_steam_refresh_finished(self, message: str) -> None:
+        self.append_log(message)
+        self.refresh_dashboard()
+
+    def on_steam_refresh_failed(self, error_message: str) -> None:
+        self.append_log(f"Error al actualizar Steam: {error_message}")
+        QMessageBox.critical(
+            self,
+            "Error al actualizar Steam",
+            error_message or "La actualizacion del perfil de Steam ha fallado.",
+        )
+
+    def on_steam_refresh_thread_finished(self) -> None:
+        self.steam_refresh_button.setEnabled(True)
+        self.steam_refresh_thread = None
 
     def update_run_progress(self, progress_rows: object) -> None:
         if not isinstance(progress_rows, list):
@@ -958,6 +1265,8 @@ class DashboardWindow(QMainWindow):
             "Steam profile temporal" if (avatar_temporary or profile_temporary) else "Steam profile actual"
         )
 
+        self.update_presence_panel(steam_status)
+
         avatar_path_value = steam_status.get("avatar_path")
         if not avatar_path_value:
             self.steam_avatar_label.setText("Sin avatar")
@@ -984,6 +1293,40 @@ class DashboardWindow(QMainWindow):
         )
         self.steam_avatar_label.setText("")
         self.steam_avatar_label.setPixmap(scaled)
+
+    def update_presence_panel(self, steam_status: dict[str, object]) -> None:
+        status_text = str(steam_status.get("presence_status") or "No iniciado")
+        detail_text = str(steam_status.get("presence_detail") or "Servicio no arrancado")
+        ready = bool(steam_status.get("presence_ready"))
+
+        refresh_token_path = self.paths.steam_presence_script.parent / "secrets" / "refreshToken.txt"
+        script_exists = self.paths.steam_presence_script.exists()
+        token_exists = refresh_token_path.exists()
+
+        self.presence_status_label.setText(status_text)
+        self.presence_status_label.setStyleSheet(
+            self._steam_badge_style(
+                self.presence_status_background(status_text, ready),
+                "#111111",
+            )
+        )
+        self.presence_detail_label.setText(detail_text)
+        self.presence_script_label.setText(
+            f"Script: {'OK' if script_exists else 'Falta'}"
+        )
+        self.presence_token_label.setText(
+            f"Refresh token: {'Detectado' if token_exists else 'No detectado'}"
+        )
+
+    def presence_status_background(self, status_text: str, ready: bool) -> str:
+        normalized = status_text.strip().lower()
+        if ready or normalized == "listo":
+            return "#b7e4c7"
+        if normalized in {"error"}:
+            return "#f5c2c7"
+        if normalized in {"iniciando", "en ejecucion", "reiniciando", "no listo"}:
+            return "#f4e7a3"
+        return "#e9e9e9"
 
     def normalize_display_name(self, value: str) -> str:
         cleaned_chars: list[str] = []
@@ -1465,6 +1808,14 @@ class DashboardWindow(QMainWindow):
             self.prepare_bloodycase_button,
             self.prepare_cs2free_button,
             self.refresh_setup_button,
+        ):
+            button.setEnabled(enabled)
+
+    def set_presence_buttons_enabled(self, enabled: bool) -> None:
+        for button in (
+            self.presence_start_button,
+            self.presence_stop_button,
+            self.presence_restart_button,
         ):
             button.setEnabled(enabled)
 
