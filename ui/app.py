@@ -103,6 +103,10 @@ class RunnerThread(QThread):
         self.base_dir = base_dir
         self.prompt_bridge = prompt_bridge
         self.log_handler = log_handler
+        self._cancel_requested = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel_requested.set()
 
     def run(self) -> None:
         try:
@@ -117,6 +121,7 @@ class RunnerThread(QThread):
                 logger,
                 history_store=history_store,
                 progress_callback=self.progress_updated.emit,
+                cancel_requested=self._cancel_requested.is_set,
             )
             set_interaction_provider(QtInputProvider(self.prompt_bridge))
             set_steam_status_callback(self.steam_status_updated.emit)
@@ -145,6 +150,7 @@ class DashboardWindow(QMainWindow):
         self.runner_thread: RunnerThread | None = None
         self.current_run_progress: dict[str, dict[str, str]] = {}
         self.diagnostic_rows: list[dict[str, object]] = []
+        self.cancel_requested_in_ui = False
 
         self.setWindowTitle("Daily Cases Bot")
         self.resize(1360, 920)
@@ -226,8 +232,11 @@ class DashboardWindow(QMainWindow):
 
         actions_layout = QHBoxLayout()
         self.run_button = QPushButton("Ejecutar flujo completo")
+        self.cancel_button = QPushButton("Cancelar ejecucion")
+        self.cancel_button.setEnabled(False)
         self.refresh_button = QPushButton("Actualizar panel")
         actions_layout.addWidget(self.run_button)
+        actions_layout.addWidget(self.cancel_button)
         actions_layout.addWidget(self.refresh_button)
         actions_layout.addStretch(1)
 
@@ -335,6 +344,7 @@ class DashboardWindow(QMainWindow):
 
     def _wire_signals(self) -> None:
         self.run_button.clicked.connect(self.start_run)
+        self.cancel_button.clicked.connect(self.cancel_run)
         self.refresh_button.clicked.connect(self.refresh_dashboard)
         self.log_emitter.message.connect(self.append_log)
         self.prompt_bridge.prompt_requested.connect(self.show_prompt_dialog)
@@ -391,6 +401,9 @@ class DashboardWindow(QMainWindow):
 
         self.append_log("Iniciando ejecucion desde la interfaz.")
         self.run_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setText("Cancelar ejecucion")
+        self.cancel_requested_in_ui = False
         self.current_run_progress = {
             site_name: {"site_name": site_name, "phase": "Pendiente", "result": "-"}
             for site_name in ("keydrop", "csgocases", "bloodycase", "cs2free")
@@ -408,6 +421,18 @@ class DashboardWindow(QMainWindow):
         self.runner_thread.finished.connect(self.on_runner_thread_finished)
         self.runner_thread.start()
 
+    def cancel_run(self) -> None:
+        if self.runner_thread is None or not self.runner_thread.isRunning():
+            return
+        self.append_log(
+            "Cancelacion solicitada desde la interfaz. El flujo se cerrara al terminar la web actual."
+        )
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.setText("Cancelando...")
+        self.cancel_requested_in_ui = True
+        self.refresh_dashboard()
+        self.runner_thread.request_cancel()
+
     def on_run_finished(self, summary: object) -> None:
         self.append_log("Ejecucion finalizada. Refrescando panel.")
         self.refresh_dashboard()
@@ -422,6 +447,10 @@ class DashboardWindow(QMainWindow):
 
     def on_runner_thread_finished(self) -> None:
         self.run_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.setText("Cancelar ejecucion")
+        self.cancel_requested_in_ui = False
+        self.runner_thread = None
 
     def update_run_progress(self, progress_rows: object) -> None:
         if not isinstance(progress_rows, list):
@@ -507,7 +536,11 @@ class DashboardWindow(QMainWindow):
                 phase = str(progress.get("phase") or "Pendiente")
                 result = str(progress.get("result") or "-")
                 if phase == "En curso":
-                    status_text = "En curso"
+                    status_text = (
+                        "Cancelando..."
+                        if self.cancel_requested_in_ui
+                        else "En curso"
+                    )
                 elif phase == "Pendiente":
                     status_text = "Pendiente"
                 elif phase == "Hecho" and result and result != "-":
@@ -560,7 +593,10 @@ class DashboardWindow(QMainWindow):
         if phase == "Pendiente":
             status_item.setBackground(QColor("#f4e7a3"))
         elif phase == "En curso":
-            status_item.setBackground(QColor("#9bd1ff"))
+            if self.cancel_requested_in_ui:
+                status_item.setBackground(QColor("#f6c177"))
+            else:
+                status_item.setBackground(QColor("#9bd1ff"))
         elif phase == "Hecho":
             result = str(progress.get("result") or "").strip().lower()
             if result == "cooldown":

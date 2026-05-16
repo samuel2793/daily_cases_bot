@@ -20,6 +20,10 @@ from .models import ExecutionSummary, SiteExecutionRecord
 from .runtime import RuntimePaths
 
 
+class RunCancelled(Exception):
+    pass
+
+
 class DailyCasesRunner:
     def __init__(
         self,
@@ -27,11 +31,13 @@ class DailyCasesRunner:
         logger: logging.Logger,
         history_store: HistoryStore | None = None,
         progress_callback: Callable[[list[dict[str, str]]], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> None:
         self.paths = paths
         self.logger = logger
         self.history_store = history_store
         self.progress_callback = progress_callback
+        self.cancel_requested = cancel_requested
 
     def run(self) -> ExecutionSummary:
         started_at = datetime.now().astimezone()
@@ -59,8 +65,11 @@ class DailyCasesRunner:
         self.logger.info("Inicializando bot para KeyDrop.")
 
         try:
+            self.raise_if_cancelled(progress_rows)
             recent_hours = playtime_monitor.check_recent_hours_once()
+            self.raise_if_cancelled(progress_rows)
             self.capture_initial_steam_profile_snapshot()
+            self.raise_if_cancelled(progress_rows)
             if recent_hours < playtime_monitor.minimum_hours:
                 self.logger.warning(
                     "Counter-Strike 2 no cumple el requisito: %s / %s en las ultimas 2 semanas. "
@@ -77,22 +86,48 @@ class DailyCasesRunner:
                     )
                     run_status = "steam_presence_not_ready"
                 else:
-                    self.mark_site_in_progress(progress_rows, "keydrop")
-                    keydrop_result = self.build_keydrop_site().run()
-                    self.mark_site_completed(progress_rows, "keydrop", keydrop_result)
+                    keydrop_result = self.run_site(
+                        progress_rows,
+                        "keydrop",
+                        self.build_keydrop_site,
+                    )
                     self.logger.info("KeyDrop finalizo con estado: %s", keydrop_result)
                     self.logger.info("Inicializando bot para CSGOCases.")
-                    self.mark_site_in_progress(progress_rows, "csgocases")
-                    csgocases_result = self.build_csgocases_site().run()
-                    self.mark_site_completed(progress_rows, "csgocases", csgocases_result)
+                    csgocases_result = self.run_site(
+                        progress_rows,
+                        "csgocases",
+                        self.build_csgocases_site,
+                    )
                     self.logger.info("Inicializando bot para BloodyCase.")
-                    self.mark_site_in_progress(progress_rows, "bloodycase")
-                    bloodycase_result = self.build_bloodycase_site().run()
-                    self.mark_site_completed(progress_rows, "bloodycase", bloodycase_result)
+                    bloodycase_result = self.run_site(
+                        progress_rows,
+                        "bloodycase",
+                        self.build_bloodycase_site,
+                    )
                     self.logger.info("Inicializando bot para CS2.free.")
-                    self.mark_site_in_progress(progress_rows, "cs2free")
-                    cs2free_result = self.build_cs2free_site().run()
-                    self.mark_site_completed(progress_rows, "cs2free", cs2free_result)
+                    cs2free_result = self.run_site(
+                        progress_rows,
+                        "cs2free",
+                        self.build_cs2free_site,
+                    )
+        except RunCancelled:
+            run_status = "cancelled"
+            self.mark_unfinished_sites_aborted(progress_rows)
+            keydrop_result = self.read_site_result(progress_rows, "keydrop", keydrop_result)
+            csgocases_result = self.read_site_result(
+                progress_rows,
+                "csgocases",
+                csgocases_result,
+            )
+            bloodycase_result = self.read_site_result(
+                progress_rows,
+                "bloodycase",
+                bloodycase_result,
+            )
+            cs2free_result = self.read_site_result(progress_rows, "cs2free", cs2free_result)
+            self.logger.info(
+                "Ejecucion cancelada desde la interfaz. Se detuvo el flujo tras finalizar la web actual."
+            )
         except KeyboardInterrupt:
             run_status = "interrupted"
             self.logger.info("Ejecucion interrumpida por el usuario.")
@@ -148,6 +183,22 @@ class DailyCasesRunner:
         if self.history_store is not None:
             self.history_store.record_execution(summary)
         return summary
+
+    def run_site(
+        self,
+        progress_rows: list[dict[str, str]],
+        site_name: str,
+        builder: Callable[[], Any],
+    ) -> str:
+        self.raise_if_cancelled(progress_rows)
+        self.mark_site_in_progress(progress_rows, site_name)
+        result = str(builder().run())
+        if self.is_cancel_requested():
+            self.mark_site_completed(progress_rows, site_name, "aborted")
+            raise RunCancelled()
+        self.mark_site_completed(progress_rows, site_name, result)
+        self.raise_if_cancelled(progress_rows)
+        return result
 
     def capture_initial_steam_profile_snapshot(self) -> None:
         steam_manager = SteamAvatarManager(
@@ -208,6 +259,50 @@ class DailyCasesRunner:
         if self.progress_callback is None:
             return
         self.progress_callback([dict(row) for row in progress_rows])
+
+    def is_cancel_requested(self) -> bool:
+        if self.cancel_requested is None:
+            return False
+        try:
+            return bool(self.cancel_requested())
+        except Exception:
+            self.logger.exception("Fallo al consultar el estado de cancelacion.")
+            return False
+
+    def raise_if_cancelled(self, progress_rows: list[dict[str, str]]) -> None:
+        if not self.is_cancel_requested():
+            return
+        self.mark_unfinished_sites_aborted(progress_rows)
+        raise RunCancelled()
+
+    def mark_unfinished_sites_aborted(
+        self,
+        progress_rows: list[dict[str, str]],
+    ) -> None:
+        changed = False
+        for row in progress_rows:
+            if row.get("phase") == "Hecho":
+                continue
+            row["phase"] = "Hecho"
+            row["result"] = "aborted"
+            changed = True
+        if changed:
+            self.emit_progress(progress_rows)
+
+    def read_site_result(
+        self,
+        progress_rows: list[dict[str, str]],
+        site_name: str,
+        fallback: str,
+    ) -> str:
+        for row in progress_rows:
+            if row.get("site_name") != site_name:
+                continue
+            result = str(row.get("result") or fallback)
+            if result and result != "-":
+                return result
+            return fallback
+        return fallback
 
     def build_keydrop_site(self) -> KeyDropSite:
         return KeyDropSite(
