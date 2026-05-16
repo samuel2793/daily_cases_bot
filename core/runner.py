@@ -7,11 +7,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from interaction import ask_text
+from playwright.sync_api import sync_playwright
 from services import SteamPresenceService
 from sites.bloodycase import BloodyCaseSite
 from sites.cs2free import CS2FreeSite
+from sites.csgocases import DEFAULT_URL as CSGOCASES_DEFAULT_URL
 from sites.csgocases import CSGOCasesSite
-from sites.keydrop import KeyDropSite
+from sites.keydrop import KeyDropSite, load_session as load_storage_session, save_session
 from sites.steam import SteamAvatarManager
 from sites.steam_playtime import SteamPlaytimeMonitor, format_hours_and_minutes
 
@@ -340,6 +342,143 @@ class DailyCasesRunner:
             workspace_dir=self.paths.data_dir,
             logger=logging.getLogger("daily_cases_bot.cs2free"),
         )
+
+    def prepare_site_session(self, site_name: str) -> str:
+        normalized = site_name.strip().lower()
+        if normalized == "steam":
+            return self.prepare_steam_session()
+        if normalized == "keydrop":
+            return self.prepare_keydrop_session()
+        if normalized == "csgocases":
+            return self.prepare_csgocases_session()
+        if normalized == "bloodycase":
+            return self.prepare_bloodycase_session()
+        if normalized == "cs2free":
+            return self.prepare_cs2free_session()
+        raise ValueError(f"Sitio no soportado para preparacion: {site_name}")
+
+    def prepare_all_sessions(self) -> list[str]:
+        messages: list[str] = []
+        for site_name in ("steam", "keydrop", "csgocases", "bloodycase", "cs2free"):
+            try:
+                messages.append(self.prepare_site_session(site_name))
+            except Exception as exc:
+                message = f"{site_name}: fallo durante la preparacion ({exc})"
+                self.logger.exception(message)
+                messages.append(message)
+        return messages
+
+    def prepare_steam_session(self) -> str:
+        self.logger.info("Preparando sesion de Steam desde la interfaz.")
+        steam_manager = SteamAvatarManager(
+            session_file=self.paths.steam_session_file,
+            workspace_dir=self.paths.data_dir,
+            logger=logging.getLogger("daily_cases_bot.steam"),
+        )
+        try:
+            steam_manager.start()
+            steam_manager.backup_current_avatar()
+            steam_manager.backup_current_profile_name()
+            self.logger.info("Sesion de Steam preparada correctamente.")
+            return "Steam preparada correctamente."
+        finally:
+            steam_manager.close()
+
+    def prepare_keydrop_session(self) -> str:
+        self.logger.info("Preparando sesion de KeyDrop desde la interfaz.")
+        site = self.build_keydrop_site()
+        with sync_playwright() as playwright:
+            site.playwright = playwright
+            site._open_browser(playwright)
+            try:
+                site.open_home_page()
+                site.dismiss_cookie_banner()
+                site.ensure_authenticated()
+                site.dismiss_cookie_banner()
+                self.logger.info("Sesion de KeyDrop preparada correctamente.")
+                return "KeyDrop preparada correctamente."
+            finally:
+                site.close()
+                site.playwright = None
+
+    def prepare_bloodycase_session(self) -> str:
+        self.logger.info("Preparando sesion de BloodyCase desde la interfaz.")
+        site = self.build_bloodycase_site()
+        with sync_playwright() as playwright:
+            site.playwright = playwright
+            site._open_browser(playwright)
+            try:
+                site.open_home_page()
+                site.dismiss_cookie_banner()
+                site.ensure_authenticated()
+                site.dismiss_cookie_banner()
+                self.logger.info("Sesion de BloodyCase preparada correctamente.")
+                return "BloodyCase preparada correctamente."
+            finally:
+                site.close()
+                site.playwright = None
+
+    def prepare_cs2free_session(self) -> str:
+        self.logger.info("Preparando sesion de CS2.free desde la interfaz.")
+        site = self.build_cs2free_site()
+        with sync_playwright() as playwright:
+            site.playwright = playwright
+            site._open_browser(playwright)
+            try:
+                site.open_home_page()
+                site.ensure_authenticated()
+                self.logger.info("Sesion de CS2.free preparada correctamente.")
+                return "CS2.free preparada correctamente."
+            finally:
+                site.close()
+                site.playwright = None
+
+    def prepare_csgocases_session(self) -> str:
+        self.logger.info("Preparando sesion de CSGOCases desde la interfaz.")
+        site = self.build_csgocases_site()
+        session_data = load_storage_session(site.session_file, site.logger)
+        with sync_playwright() as playwright:
+            browser, context, page = site.open_balance_check_browser(playwright, session_data)
+            try:
+                page.goto(CSGOCASES_DEFAULT_URL, wait_until="domcontentloaded", timeout=25_000)
+                site.wait_for_light_page_ready(page)
+                if site.find_balance_text(page):
+                    self.logger.info("Sesion reutilizada automaticamente en CSGOCases.")
+                    save_session(context, site.session_file, site.logger)
+                    return "CSGOCases preparada correctamente."
+
+                self.logger.warning(
+                    "No hay sesion valida de CSGOCases. Se requiere login manual."
+                )
+                while True:
+                    answer = ask_text(
+                        "Haz login manual en CSGOCases en la ventana de Chromium y luego pulsa Enter aqui. "
+                        "Escribe 'q' para cancelar: ",
+                        title="Login manual en CSGOCases",
+                    ).strip().lower()
+                    if answer in {"q", "quit", "exit"}:
+                        raise RuntimeError("Login manual de CSGOCases cancelado por el usuario.")
+                    page.goto(CSGOCASES_DEFAULT_URL, wait_until="domcontentloaded", timeout=25_000)
+                    site.wait_for_light_page_ready(page)
+                    if site.find_balance_text(page):
+                        save_session(context, site.session_file, site.logger)
+                        self.logger.info("Sesion de CSGOCases preparada correctamente.")
+                        return "CSGOCases preparada correctamente."
+                    retry = ask_text(
+                        "No se pudo confirmar el login en CSGOCases. Enter para revisar otra vez o 'q' para salir: ",
+                        title="Reintento de login en CSGOCases",
+                    ).strip().lower()
+                    if retry in {"q", "quit", "exit"}:
+                        raise RuntimeError("Login manual de CSGOCases cancelado por el usuario.")
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
     def collect_site_results(
         self,

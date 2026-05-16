@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
+import shutil
 import threading
 import unicodedata
 from pathlib import Path
@@ -135,6 +137,45 @@ class RunnerThread(QThread):
             set_steam_status_callback(None)
 
 
+class PreparationThread(QThread):
+    preparation_finished = Signal(object)
+    preparation_failed = Signal(str)
+    steam_status_updated = Signal(object)
+
+    def __init__(
+        self,
+        base_dir: Path,
+        prompt_bridge: PromptBridge,
+        log_handler: logging.Handler,
+        target: str,
+    ) -> None:
+        super().__init__()
+        self.base_dir = base_dir
+        self.prompt_bridge = prompt_bridge
+        self.log_handler = log_handler
+        self.target = target
+
+    def run(self) -> None:
+        try:
+            paths = RuntimePaths.from_base_dir(self.base_dir)
+            ensure_runtime_dirs(paths)
+            configure_steam_status_store(paths.steam_state_file)
+            logger = configure_logging(paths.log_file, extra_handlers=[self.log_handler])
+            runner = DailyCasesRunner(paths, logger)
+            set_interaction_provider(QtInputProvider(self.prompt_bridge))
+            set_steam_status_callback(self.steam_status_updated.emit)
+            if self.target == "all":
+                result = runner.prepare_all_sessions()
+            else:
+                result = runner.prepare_site_session(self.target)
+            self.preparation_finished.emit(result)
+        except Exception as exc:
+            self.preparation_failed.emit(str(exc))
+        finally:
+            reset_interaction_provider()
+            set_steam_status_callback(None)
+
+
 class DashboardWindow(QMainWindow):
     def __init__(self, base_dir: Path) -> None:
         super().__init__()
@@ -149,16 +190,19 @@ class DashboardWindow(QMainWindow):
         self.log_handler = QtLogHandler(self.log_emitter)
         self.prompt_bridge = PromptBridge()
         self.runner_thread: RunnerThread | None = None
+        self.preparation_thread: PreparationThread | None = None
         self.current_run_progress: dict[str, dict[str, str]] = {}
         self.run_history_rows: list[dict[str, object]] = []
         self.all_diagnostic_rows: list[dict[str, object]] = []
         self.diagnostic_rows: list[dict[str, object]] = []
         self.cancel_requested_in_ui = False
+        self.setup_autofocus_done = False
 
         self.setWindowTitle("Daily Cases Bot")
         self.resize(1360, 920)
         self._build_ui()
         self._wire_signals()
+        self.tabs.setCurrentWidget(self.dashboard_tab)
         self.refresh_dashboard()
 
     def _build_ui(self) -> None:
@@ -169,8 +213,61 @@ class DashboardWindow(QMainWindow):
         self.tabs = QTabWidget()
         root_layout.addWidget(self.tabs)
 
-        dashboard_tab = QWidget()
-        dashboard_layout = QVBoxLayout(dashboard_tab)
+        self.setup_tab = QWidget()
+        setup_layout = QVBoxLayout(self.setup_tab)
+
+        self.setup_summary_label = QLabel("Comprobando configuracion inicial...")
+        self.setup_summary_label.setWordWrap(True)
+
+        setup_actions_layout = QHBoxLayout()
+        self.refresh_setup_button = QPushButton("Revisar configuracion")
+        self.prepare_all_button = QPushButton("Preparar todo")
+        self.open_sessions_dir_button = QPushButton("Abrir sesiones")
+        self.open_logs_dir_button = QPushButton("Abrir logs")
+        self.open_data_dir_button = QPushButton("Abrir datos")
+        setup_actions_layout.addWidget(self.refresh_setup_button)
+        setup_actions_layout.addWidget(self.prepare_all_button)
+        setup_actions_layout.addWidget(self.open_sessions_dir_button)
+        setup_actions_layout.addWidget(self.open_logs_dir_button)
+        setup_actions_layout.addWidget(self.open_data_dir_button)
+        setup_actions_layout.addStretch(1)
+
+        prepare_buttons_layout = QHBoxLayout()
+        self.prepare_steam_button = QPushButton("Preparar Steam")
+        self.prepare_keydrop_button = QPushButton("Preparar KeyDrop")
+        self.prepare_csgocases_button = QPushButton("Preparar CSGOCases")
+        self.prepare_bloodycase_button = QPushButton("Preparar BloodyCase")
+        self.prepare_cs2free_button = QPushButton("Preparar CS2.free")
+        prepare_buttons_layout.addWidget(self.prepare_steam_button)
+        prepare_buttons_layout.addWidget(self.prepare_keydrop_button)
+        prepare_buttons_layout.addWidget(self.prepare_csgocases_button)
+        prepare_buttons_layout.addWidget(self.prepare_bloodycase_button)
+        prepare_buttons_layout.addWidget(self.prepare_cs2free_button)
+        prepare_buttons_layout.addStretch(1)
+
+        self.setup_table = QTableWidget(0, 4)
+        self.setup_table.setHorizontalHeaderLabels(
+            ["Categoria", "Elemento", "Estado", "Detalle"]
+        )
+        self.setup_table.verticalHeader().setVisible(False)
+        self.setup_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.setup_table.setSelectionMode(QTableWidget.NoSelection)
+        self.setup_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+
+        self.setup_login_label = QLabel(
+            "La guia indicara aqui que webs pediran login manual en la primera ejecucion."
+        )
+        self.setup_login_label.setWordWrap(True)
+
+        setup_layout.addWidget(self.setup_summary_label)
+        setup_layout.addLayout(setup_actions_layout)
+        setup_layout.addLayout(prepare_buttons_layout)
+        setup_layout.addWidget(self.setup_table, stretch=1)
+        setup_layout.addWidget(self.setup_login_label)
+        self.tabs.addTab(self.setup_tab, "Primera ejecucion")
+
+        self.dashboard_tab = QWidget()
+        dashboard_layout = QVBoxLayout(self.dashboard_tab)
 
         header_layout = QHBoxLayout()
 
@@ -302,7 +399,7 @@ class DashboardWindow(QMainWindow):
         dashboard_layout.addLayout(actions_layout)
         dashboard_layout.addWidget(top_splitter, stretch=1)
         dashboard_layout.addWidget(bottom_splitter, stretch=1)
-        self.tabs.addTab(dashboard_tab, "Panel")
+        self.tabs.addTab(self.dashboard_tab, "Panel")
 
         history_tab = QWidget()
         history_layout = QVBoxLayout(history_tab)
@@ -397,6 +494,22 @@ class DashboardWindow(QMainWindow):
         self.run_button.clicked.connect(self.start_run)
         self.cancel_button.clicked.connect(self.cancel_run)
         self.refresh_button.clicked.connect(self.refresh_dashboard)
+        self.refresh_setup_button.clicked.connect(self.refresh_setup_tab)
+        self.prepare_all_button.clicked.connect(lambda: self.start_preparation("all"))
+        self.prepare_steam_button.clicked.connect(lambda: self.start_preparation("steam"))
+        self.prepare_keydrop_button.clicked.connect(lambda: self.start_preparation("keydrop"))
+        self.prepare_csgocases_button.clicked.connect(lambda: self.start_preparation("csgocases"))
+        self.prepare_bloodycase_button.clicked.connect(lambda: self.start_preparation("bloodycase"))
+        self.prepare_cs2free_button.clicked.connect(lambda: self.start_preparation("cs2free"))
+        self.open_sessions_dir_button.clicked.connect(
+            lambda: self.open_local_path(self.paths.sessions_dir)
+        )
+        self.open_logs_dir_button.clicked.connect(
+            lambda: self.open_local_path(self.paths.logs_dir)
+        )
+        self.open_data_dir_button.clicked.connect(
+            lambda: self.open_local_path(self.paths.data_dir)
+        )
         self.log_emitter.message.connect(self.append_log)
         self.prompt_bridge.prompt_requested.connect(self.show_prompt_dialog)
         self.runs_table.itemSelectionChanged.connect(self.on_run_selection_changed)
@@ -459,6 +572,13 @@ class DashboardWindow(QMainWindow):
                 "Ya hay una ejecucion en curso.",
             )
             return
+        if self.preparation_thread is not None and self.preparation_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Preparacion en curso",
+                "Ya hay una preparacion de sesiones en curso.",
+            )
+            return
 
         self.append_log("Iniciando ejecucion desde la interfaz.")
         self.run_button.setEnabled(False)
@@ -481,6 +601,39 @@ class DashboardWindow(QMainWindow):
         self.runner_thread.steam_status_updated.connect(self.update_steam_panel)
         self.runner_thread.finished.connect(self.on_runner_thread_finished)
         self.runner_thread.start()
+
+    def start_preparation(self, target: str) -> None:
+        if self.runner_thread is not None and self.runner_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Ejecucion en curso",
+                "No se puede preparar sesiones mientras el flujo completo esta en marcha.",
+            )
+            return
+        if self.preparation_thread is not None and self.preparation_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Preparacion en curso",
+                "Ya hay una preparacion de sesiones en curso.",
+            )
+            return
+
+        target_label = "todas las sesiones" if target == "all" else target
+        self.append_log(f"Iniciando preparacion de {target_label} desde la interfaz.")
+        self.set_preparation_buttons_enabled(False)
+        self.preparation_thread = PreparationThread(
+            self.base_dir,
+            self.prompt_bridge,
+            self.log_handler,
+            target,
+        )
+        self.preparation_thread.preparation_finished.connect(
+            self.on_preparation_finished
+        )
+        self.preparation_thread.preparation_failed.connect(self.on_preparation_failed)
+        self.preparation_thread.steam_status_updated.connect(self.update_steam_panel)
+        self.preparation_thread.finished.connect(self.on_preparation_thread_finished)
+        self.preparation_thread.start()
 
     def cancel_run(self) -> None:
         if self.runner_thread is None or not self.runner_thread.isRunning():
@@ -513,6 +666,27 @@ class DashboardWindow(QMainWindow):
         self.cancel_requested_in_ui = False
         self.runner_thread = None
 
+    def on_preparation_finished(self, result: object) -> None:
+        if isinstance(result, list):
+            message = "\n".join(str(item) for item in result)
+        else:
+            message = str(result)
+        self.append_log(f"Preparacion finalizada: {message}")
+        self.refresh_dashboard()
+        QMessageBox.information(self, "Preparacion completada", message)
+
+    def on_preparation_failed(self, error_message: str) -> None:
+        self.append_log(f"Error en la preparacion: {error_message}")
+        QMessageBox.critical(
+            self,
+            "Error en la preparacion",
+            error_message or "La preparacion ha fallado sin mensaje adicional.",
+        )
+
+    def on_preparation_thread_finished(self) -> None:
+        self.set_preparation_buttons_enabled(True)
+        self.preparation_thread = None
+
     def update_run_progress(self, progress_rows: object) -> None:
         if not isinstance(progress_rows, list):
             return
@@ -524,6 +698,7 @@ class DashboardWindow(QMainWindow):
         self.refresh_dashboard()
 
     def refresh_dashboard(self) -> None:
+        self.refresh_setup_tab()
         self.total_balance_label.setText(self.format_amount(self.load_total_balance()))
         self.today_total_label.setText(
             self.format_amount(self.history_store.get_today_positive_total())
@@ -585,6 +760,60 @@ class DashboardWindow(QMainWindow):
 
         self.refresh_runs_table()
         self.refresh_diagnostics_table()
+
+    def refresh_setup_tab(self) -> None:
+        checks = self.build_setup_checks()
+        self.setup_table.setRowCount(len(checks))
+
+        pending_logins: list[str] = []
+        blocking_issues: list[str] = []
+
+        for row_index, check in enumerate(checks):
+            category = str(check["category"])
+            element = str(check["element"])
+            status = str(check["status"])
+            detail = str(check["detail"])
+
+            self.set_table_item(self.setup_table, row_index, 0, category)
+            self.set_table_item(self.setup_table, row_index, 1, element)
+            self.set_status_table_item(self.setup_table, row_index, 2, status)
+            self.set_table_item(self.setup_table, row_index, 3, detail)
+
+            if category == "Sesion" and status != "OK":
+                pending_logins.append(element)
+            if category in ("Dependencia", "Recurso", "Ruta") and status == "FALTA":
+                blocking_issues.append(f"{element}: {detail}")
+
+        has_non_ok_status = any(str(check["status"]) != "OK" for check in checks)
+
+        if blocking_issues:
+            self.setup_summary_label.setText(
+                "Faltan elementos antes de una primera ejecucion fiable: "
+                + " | ".join(blocking_issues)
+            )
+        elif pending_logins:
+            self.setup_summary_label.setText(
+                "La app esta lista, pero algunas webs pediran login manual la primera vez."
+            )
+        else:
+            self.setup_summary_label.setText(
+                "La configuracion base parece completa. Puedes ejecutar el flujo desde la interfaz."
+            )
+
+        if pending_logins:
+            self.setup_login_label.setText(
+                "Webs que probablemente pediran login manual en la primera ejecucion: "
+                + ", ".join(pending_logins)
+                + "."
+            )
+        else:
+            self.setup_login_label.setText(
+                "Todas las sesiones detectadas tienen un archivo guardado. Si alguna web expira, la app pedira login manual solo para esa web."
+            )
+
+        if has_non_ok_status and not self.setup_autofocus_done:
+            self.tabs.setCurrentWidget(self.setup_tab)
+            self.setup_autofocus_done = True
 
     def refresh_site_table(self, latest_site_rows: dict[str, dict[str, object]]) -> None:
         ordered_sites = ["keydrop", "csgocases", "bloodycase", "cs2free"]
@@ -888,6 +1117,81 @@ class DashboardWindow(QMainWindow):
 
         return "\n".join(lines)
 
+    def build_setup_checks(self) -> list[dict[str, str]]:
+        checks: list[dict[str, str]] = []
+        pyside_available = importlib.util.find_spec("PySide6") is not None
+        playwright_available = importlib.util.find_spec("playwright") is not None
+        node_available = shutil.which("node") is not None
+
+        checks.extend(
+            [
+                self.make_check(
+                    "Dependencia",
+                    "PySide6",
+                    pyside_available,
+                    "Interfaz grafica disponible."
+                    if pyside_available
+                    else "Falta PySide6 en el entorno.",
+                ),
+                self.make_check(
+                    "Dependencia",
+                    "Playwright",
+                    playwright_available,
+                    "Playwright disponible."
+                    if playwright_available
+                    else "Falta Playwright en el entorno.",
+                ),
+                self.make_check(
+                    "Dependencia",
+                    "Node.js",
+                    node_available,
+                    "Node detectado para Steam Presence."
+                    if node_available
+                    else "No se encontro el ejecutable 'node'.",
+                ),
+            ]
+        )
+
+        checks.extend(
+            [
+                self.make_path_check("Ruta", "Carpeta sessions", self.paths.sessions_dir),
+                self.make_path_check("Ruta", "Carpeta logs", self.paths.logs_dir),
+                self.make_path_check("Ruta", "Carpeta data", self.paths.data_dir),
+                self.make_file_check(
+                    "Recurso",
+                    "Steam Presence script",
+                    self.paths.steam_presence_script,
+                ),
+                self.make_file_check(
+                    "Recurso",
+                    "Avatar KeyDrop",
+                    self.paths.keydrop_steam_avatar_file,
+                ),
+                self.make_file_check(
+                    "Recurso",
+                    "Avatar CSGOCases",
+                    self.paths.csgocases_steam_avatar_file,
+                ),
+                self.make_file_check(
+                    "Recurso",
+                    "Avatar BloodyCase",
+                    self.paths.bloodycase_steam_avatar_file,
+                ),
+            ]
+        )
+
+        checks.extend(
+            [
+                self.make_session_check("Steam", self.paths.steam_session_file),
+                self.make_session_check("KeyDrop", self.paths.keydrop_session_file),
+                self.make_session_check("CSGOCases", self.paths.csgocases_session_file),
+                self.make_session_check("BloodyCase", self.paths.bloodycase_session_file),
+                self.make_session_check("CS2.free", self.paths.cs2free_session_file),
+            ]
+        )
+
+        return checks
+
     def refresh_diagnostics_table(self) -> None:
         previous_row_index = self.diagnostics_table.currentRow()
         previous_site = self.diagnostic_site_filter.currentText()
@@ -1137,6 +1441,33 @@ class DashboardWindow(QMainWindow):
                 f"No se pudo abrir {target_path.name}.",
             )
 
+    def open_local_path(self, path: Path) -> None:
+        if not path.exists():
+            QMessageBox.warning(
+                self,
+                "Ruta no disponible",
+                f"La ruta {path} no existe.",
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve()))):
+            QMessageBox.warning(
+                self,
+                "No se pudo abrir",
+                f"No se pudo abrir {path}.",
+            )
+
+    def set_preparation_buttons_enabled(self, enabled: bool) -> None:
+        for button in (
+            self.prepare_all_button,
+            self.prepare_steam_button,
+            self.prepare_keydrop_button,
+            self.prepare_csgocases_button,
+            self.prepare_bloodycase_button,
+            self.prepare_cs2free_button,
+            self.refresh_setup_button,
+        ):
+            button.setEnabled(enabled)
+
     def show_prompt_dialog(self, request: PromptRequest) -> None:
         text, accepted = QInputDialog.getText(
             self,
@@ -1158,6 +1489,24 @@ class DashboardWindow(QMainWindow):
     ) -> None:
         table.setItem(row, column, QTableWidgetItem(value))
 
+    def set_status_table_item(
+        self,
+        table: QTableWidget,
+        row: int,
+        column: int,
+        value: str,
+    ) -> None:
+        item = QTableWidgetItem(value)
+        item.setTextAlignment(Qt.AlignCenter)
+        item.setForeground(QColor("#111111"))
+        if value == "OK":
+            item.setBackground(QColor("#b7e4c7"))
+        elif value == "PENDIENTE":
+            item.setBackground(QColor("#f4e7a3"))
+        else:
+            item.setBackground(QColor("#f5c2c7"))
+        table.setItem(row, column, item)
+
     def set_presence_item(
         self,
         table: QTableWidget,
@@ -1170,6 +1519,69 @@ class DashboardWindow(QMainWindow):
         item.setForeground(QColor("#111111"))
         item.setBackground(QColor("#b7e4c7") if present else QColor("#f5c2c7"))
         table.setItem(row, column, item)
+
+    def make_check(
+        self,
+        category: str,
+        element: str,
+        ok: bool,
+        detail: str,
+    ) -> dict[str, str]:
+        return {
+            "category": category,
+            "element": element,
+            "status": "OK" if ok else "FALTA",
+            "detail": detail,
+        }
+
+    def make_path_check(self, category: str, element: str, path: Path) -> dict[str, str]:
+        return self.make_check(
+            category,
+            element,
+            path.exists() and path.is_dir(),
+            str(path),
+        )
+
+    def make_file_check(self, category: str, element: str, path: Path) -> dict[str, str]:
+        return self.make_check(
+            category,
+            element,
+            path.exists() and path.is_file(),
+            str(path),
+        )
+
+    def make_session_check(self, site_name: str, path: Path) -> dict[str, str]:
+        if not path.exists():
+            return {
+                "category": "Sesion",
+                "element": site_name,
+                "status": "PENDIENTE",
+                "detail": f"No existe sesion previa en {path.name}. La app pedira login manual la primera vez.",
+            }
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {
+                "category": "Sesion",
+                "element": site_name,
+                "status": "FALTA",
+                "detail": f"El archivo {path.name} existe pero no se pudo leer correctamente.",
+            }
+
+        if isinstance(payload, dict) and payload:
+            return {
+                "category": "Sesion",
+                "element": site_name,
+                "status": "OK",
+                "detail": f"Sesion detectada en {path.name}.",
+            }
+
+        return {
+            "category": "Sesion",
+            "element": site_name,
+            "status": "PENDIENTE",
+            "detail": f"El archivo {path.name} esta vacio o no contiene datos utiles. La app pedira login manual.",
+        }
 
     def format_amount(self, value: object) -> str:
         if value is None:
