@@ -397,6 +397,36 @@ class DashboardWindow(QMainWindow):
         self.setup_table.setSelectionMode(QTableWidget.NoSelection)
         self.setup_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
 
+        session_group = QGroupBox("Mantenimiento de sesiones")
+        session_layout = QVBoxLayout(session_group)
+        session_actions_layout = QHBoxLayout()
+        self.revalidate_session_button = QPushButton("Revalidar sesion")
+        self.delete_session_button = QPushButton("Borrar sesion")
+        self.revalidate_session_button.setEnabled(False)
+        self.delete_session_button.setEnabled(False)
+        session_actions_layout.addWidget(self.revalidate_session_button)
+        session_actions_layout.addWidget(self.delete_session_button)
+        session_actions_layout.addStretch(1)
+
+        self.session_table = QTableWidget(0, 4)
+        self.session_table.setHorizontalHeaderLabels(
+            ["Sitio", "Estado", "Actualizada", "Archivo"]
+        )
+        self.session_table.verticalHeader().setVisible(False)
+        self.session_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.session_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.session_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.session_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+
+        self.session_detail_label = QLabel(
+            "Selecciona una sesion para revalidarla o borrarla."
+        )
+        self.session_detail_label.setWordWrap(True)
+
+        session_layout.addLayout(session_actions_layout)
+        session_layout.addWidget(self.session_table)
+        session_layout.addWidget(self.session_detail_label)
+
         self.setup_login_label = QLabel(
             "La guia indicara aqui que webs pediran login manual en la primera ejecucion."
         )
@@ -406,6 +436,7 @@ class DashboardWindow(QMainWindow):
         setup_layout.addLayout(setup_actions_layout)
         setup_layout.addLayout(prepare_buttons_layout)
         setup_layout.addWidget(self.setup_table, stretch=1)
+        setup_layout.addWidget(session_group, stretch=1)
         setup_layout.addWidget(self.setup_login_label)
         self.tabs.addTab(self.setup_tab, "Primera ejecucion")
 
@@ -807,6 +838,11 @@ class DashboardWindow(QMainWindow):
         self.prepare_csgocases_button.clicked.connect(lambda: self.start_preparation("csgocases"))
         self.prepare_bloodycase_button.clicked.connect(lambda: self.start_preparation("bloodycase"))
         self.prepare_cs2free_button.clicked.connect(lambda: self.start_preparation("cs2free"))
+        self.revalidate_session_button.clicked.connect(self.revalidate_selected_session)
+        self.delete_session_button.clicked.connect(self.delete_selected_session)
+        self.session_table.itemSelectionChanged.connect(
+            self.on_session_selection_changed
+        )
         self.steam_refresh_button.clicked.connect(self.start_steam_refresh)
         self.presence_start_button.clicked.connect(
             lambda: self.start_presence_command("start")
@@ -1143,6 +1179,7 @@ class DashboardWindow(QMainWindow):
         self.cancel_button.setText("Cancelar ejecucion")
         self.cancel_requested_in_ui = False
         self.runner_thread = None
+        self.on_session_selection_changed()
 
     def on_preparation_finished(self, result: object) -> None:
         if isinstance(result, list):
@@ -1164,6 +1201,7 @@ class DashboardWindow(QMainWindow):
     def on_preparation_thread_finished(self) -> None:
         self.set_preparation_buttons_enabled(True)
         self.preparation_thread = None
+        self.on_session_selection_changed()
 
     def on_presence_command_finished(self, message: str) -> None:
         self.append_log(message)
@@ -1180,6 +1218,7 @@ class DashboardWindow(QMainWindow):
     def on_presence_command_thread_finished(self) -> None:
         self.set_presence_buttons_enabled(True)
         self.presence_thread = None
+        self.on_session_selection_changed()
 
     def on_steam_refresh_finished(self, message: str) -> None:
         self.append_log(message)
@@ -1196,6 +1235,7 @@ class DashboardWindow(QMainWindow):
     def on_steam_refresh_thread_finished(self) -> None:
         self.steam_refresh_button.setEnabled(True)
         self.steam_refresh_thread = None
+        self.on_session_selection_changed()
 
     def update_run_progress(self, progress_rows: object) -> None:
         if not isinstance(progress_rows, list):
@@ -1277,6 +1317,7 @@ class DashboardWindow(QMainWindow):
 
     def refresh_setup_tab(self) -> None:
         checks = self.build_setup_checks()
+        self.refresh_session_table()
         self.setup_table.setRowCount(len(checks))
 
         pending_logins: list[str] = []
@@ -1333,6 +1374,142 @@ class DashboardWindow(QMainWindow):
         ):
             self.tabs.setCurrentWidget(self.setup_tab)
             self.setup_autofocus_done = True
+
+    def refresh_session_table(self) -> None:
+        previous_row_index = self.session_table.currentRow()
+        rows = self.build_session_rows()
+        self.session_rows = rows
+        self.session_table.setRowCount(len(rows))
+
+        for row_index, row in enumerate(rows):
+            self.set_table_item(self.session_table, row_index, 0, str(row["site_name"]))
+            self.set_status_table_item(
+                self.session_table,
+                row_index,
+                1,
+                str(row["status"]),
+            )
+            self.set_table_item(
+                self.session_table,
+                row_index,
+                2,
+                str(row["updated_at"]),
+            )
+            self.set_table_item(
+                self.session_table,
+                row_index,
+                3,
+                str(row["file_name"]),
+            )
+
+        if rows:
+            target_row = previous_row_index if previous_row_index >= 0 else 0
+            target_row = min(target_row, len(rows) - 1)
+            self.session_table.selectRow(target_row)
+            self.on_session_selection_changed()
+        else:
+            self.session_detail_label.setText("No hay sesiones configuradas todavia.")
+            self.revalidate_session_button.setEnabled(False)
+            self.delete_session_button.setEnabled(False)
+
+    def build_session_rows(self) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        for site_key, site_name, path in self.get_session_entries():
+            check = self.make_session_check(site_name, path)
+            updated_at = "-"
+            if path.exists():
+                try:
+                    updated_at = datetime.fromtimestamp(path.stat().st_mtime).astimezone().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                except Exception:
+                    updated_at = "-"
+            rows.append(
+                {
+                    "site_key": site_key,
+                    "site_name": site_name,
+                    "status": str(check["status"]),
+                    "detail": str(check["detail"]),
+                    "updated_at": updated_at,
+                    "file_name": path.name,
+                }
+            )
+        return rows
+
+    def get_session_entries(self) -> list[tuple[str, str, Path]]:
+        return [
+            ("steam", "Steam", self.paths.steam_session_file),
+            ("keydrop", "KeyDrop", self.paths.keydrop_session_file),
+            ("csgocases", "CSGOCases", self.paths.csgocases_session_file),
+            ("bloodycase", "BloodyCase", self.paths.bloodycase_session_file),
+            ("cs2free", "CS2.free", self.paths.cs2free_session_file),
+        ]
+
+    def get_selected_session_row(self) -> dict[str, str] | None:
+        row_index = self.session_table.currentRow()
+        if row_index < 0:
+            return None
+        if row_index >= len(getattr(self, "session_rows", [])):
+            return None
+        return self.session_rows[row_index]
+
+    def on_session_selection_changed(self) -> None:
+        row = self.get_selected_session_row()
+        if row is None:
+            self.session_detail_label.setText(
+                "Selecciona una sesion para revalidarla o borrarla."
+            )
+            self.revalidate_session_button.setEnabled(False)
+            self.delete_session_button.setEnabled(False)
+            return
+
+        self.session_detail_label.setText(
+            f"{row['site_name']}: {row['detail']}"
+        )
+        buttons_enabled = not self.is_any_background_task_running()
+        self.revalidate_session_button.setEnabled(buttons_enabled)
+        self.delete_session_button.setEnabled(buttons_enabled)
+
+    def revalidate_selected_session(self) -> None:
+        row = self.get_selected_session_row()
+        if row is None:
+            return
+        self.start_preparation(str(row["site_key"]))
+
+    def delete_selected_session(self) -> None:
+        row = self.get_selected_session_row()
+        if row is None:
+            return
+        site_key = str(row["site_key"])
+        site_name = str(row["site_name"])
+        session_path = next(
+            (path for key, _, path in self.get_session_entries() if key == site_key),
+            None,
+        )
+        if session_path is None:
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Borrar sesion",
+            f"Se borrara la sesion guardada de {site_name}.\n\nArchivo: {session_path.name}\n\n¿Quieres continuar?",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            if session_path.exists():
+                session_path.unlink()
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "No se pudo borrar",
+                f"No se pudo borrar {session_path.name}: {exc}",
+            )
+            return
+
+        self.append_log(f"Sesion borrada: {site_name}")
+        self.refresh_setup_tab()
 
     def refresh_site_table(self, latest_site_rows: dict[str, dict[str, object]]) -> None:
         ordered_sites = ["keydrop", "csgocases", "bloodycase", "cs2free"]
@@ -2141,6 +2318,20 @@ class DashboardWindow(QMainWindow):
                 "No se pudo abrir",
                 f"No se pudo abrir {path}.",
             )
+
+    def is_any_background_task_running(self) -> bool:
+        return bool(
+            (self.runner_thread is not None and self.runner_thread.isRunning())
+            or (
+                self.preparation_thread is not None
+                and self.preparation_thread.isRunning()
+            )
+            or (self.presence_thread is not None and self.presence_thread.isRunning())
+            or (
+                self.steam_refresh_thread is not None
+                and self.steam_refresh_thread.isRunning()
+            )
+        )
 
     def set_preparation_buttons_enabled(self, enabled: bool) -> None:
         for button in (
