@@ -5,7 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-SITE_ORDER = ["keydrop", "csgocases", "bloodycase", "cs2free"]
+SITE_ORDER = ["keydrop", "csgocases", "bloodycase", "cs2free", "g4skins"]
 TAB_OPTIONS = [
     "Panel",
     "Primera ejecucion",

@@ -381,11 +381,13 @@ class DashboardWindow(QMainWindow):
         self.prepare_csgocases_button = QPushButton("Preparar CSGOCases")
         self.prepare_bloodycase_button = QPushButton("Preparar BloodyCase")
         self.prepare_cs2free_button = QPushButton("Preparar CS2.free")
+        self.prepare_g4skins_button = QPushButton("Preparar G4Skins")
         prepare_buttons_layout.addWidget(self.prepare_steam_button)
         prepare_buttons_layout.addWidget(self.prepare_keydrop_button)
         prepare_buttons_layout.addWidget(self.prepare_csgocases_button)
         prepare_buttons_layout.addWidget(self.prepare_bloodycase_button)
         prepare_buttons_layout.addWidget(self.prepare_cs2free_button)
+        prepare_buttons_layout.addWidget(self.prepare_g4skins_button)
         prepare_buttons_layout.addStretch(1)
 
         self.setup_table = QTableWidget(0, 4)
@@ -585,7 +587,7 @@ class DashboardWindow(QMainWindow):
         actions_layout.addWidget(self.refresh_button)
         actions_layout.addStretch(1)
 
-        self.site_table = QTableWidget(4, 6)
+        self.site_table = QTableWidget(len(SITE_ORDER), 6)
         self.site_table.setHorizontalHeaderLabels(
             ["Sitio", "Estado", "Saldo", "Recompensa", "Tipo", "Delta"]
         )
@@ -649,7 +651,7 @@ class DashboardWindow(QMainWindow):
         self.history_tab = QWidget()
         history_layout = QVBoxLayout(self.history_tab)
 
-        self.runs_table = QTableWidget(0, 9)
+        self.runs_table = QTableWidget(0, 10)
         self.runs_table.setHorizontalHeaderLabels(
             [
                 "Fecha",
@@ -660,6 +662,7 @@ class DashboardWindow(QMainWindow):
                 "CSGOCases",
                 "BloodyCase",
                 "CS2.free",
+                "G4Skins",
                 "Delta",
             ]
         )
@@ -757,10 +760,12 @@ class DashboardWindow(QMainWindow):
         self.enable_csgocases_checkbox = QCheckBox("Ejecutar CSGOCases")
         self.enable_bloodycase_checkbox = QCheckBox("Ejecutar BloodyCase")
         self.enable_cs2free_checkbox = QCheckBox("Ejecutar CS2.free")
+        self.enable_g4skins_checkbox = QCheckBox("Ejecutar G4Skins")
         flow_layout.addWidget(self.enable_keydrop_checkbox)
         flow_layout.addWidget(self.enable_csgocases_checkbox)
         flow_layout.addWidget(self.enable_bloodycase_checkbox)
         flow_layout.addWidget(self.enable_cs2free_checkbox)
+        flow_layout.addWidget(self.enable_g4skins_checkbox)
         flow_layout.addStretch(1)
 
         steam_group_settings = QGroupBox("Steam")
@@ -838,6 +843,7 @@ class DashboardWindow(QMainWindow):
         self.prepare_csgocases_button.clicked.connect(lambda: self.start_preparation("csgocases"))
         self.prepare_bloodycase_button.clicked.connect(lambda: self.start_preparation("bloodycase"))
         self.prepare_cs2free_button.clicked.connect(lambda: self.start_preparation("cs2free"))
+        self.prepare_g4skins_button.clicked.connect(lambda: self.start_preparation("g4skins"))
         self.revalidate_session_button.clicked.connect(self.revalidate_selected_session)
         self.delete_session_button.clicked.connect(self.delete_selected_session)
         self.session_table.itemSelectionChanged.connect(
@@ -1443,6 +1449,7 @@ class DashboardWindow(QMainWindow):
             ("csgocases", "CSGOCases", self.paths.csgocases_session_file),
             ("bloodycase", "BloodyCase", self.paths.bloodycase_session_file),
             ("cs2free", "CS2.free", self.paths.cs2free_session_file),
+            ("g4skins", "G4Skins", self.paths.g4skins_session_file),
         ]
 
     def get_selected_session_row(self) -> dict[str, str] | None:
@@ -1512,7 +1519,7 @@ class DashboardWindow(QMainWindow):
         self.refresh_setup_tab()
 
     def refresh_site_table(self, latest_site_rows: dict[str, dict[str, object]]) -> None:
-        ordered_sites = ["keydrop", "csgocases", "bloodycase", "cs2free"]
+        ordered_sites = list(SITE_ORDER)
         self.site_table.setRowCount(len(ordered_sites))
         for row_index, site_name in enumerate(ordered_sites):
             row = latest_site_rows.get(site_name, {})
@@ -1914,6 +1921,12 @@ class DashboardWindow(QMainWindow):
                 self.runs_table,
                 row_index,
                 8,
+                site_status_map.get("g4skins", "-"),
+            )
+            self.set_table_item(
+                self.runs_table,
+                row_index,
+                9,
                 self.format_amount(run_row.get("positive_delta")),
             )
 
@@ -2046,6 +2059,7 @@ class DashboardWindow(QMainWindow):
                 self.make_session_check("CSGOCases", self.paths.csgocases_session_file),
                 self.make_session_check("BloodyCase", self.paths.bloodycase_session_file),
                 self.make_session_check("CS2.free", self.paths.cs2free_session_file),
+                self.make_session_check("G4Skins", self.paths.g4skins_session_file),
             ]
         )
 
@@ -2341,6 +2355,7 @@ class DashboardWindow(QMainWindow):
             self.prepare_csgocases_button,
             self.prepare_bloodycase_button,
             self.prepare_cs2free_button,
+            self.prepare_g4skins_button,
             self.refresh_setup_button,
         ):
             button.setEnabled(enabled)
@@ -2371,6 +2386,7 @@ class DashboardWindow(QMainWindow):
         self.enable_csgocases_checkbox.setChecked("csgocases" in enabled_sites)
         self.enable_bloodycase_checkbox.setChecked("bloodycase" in enabled_sites)
         self.enable_cs2free_checkbox.setChecked("cs2free" in enabled_sites)
+        self.enable_g4skins_checkbox.setChecked("g4skins" in enabled_sites)
 
         self.use_presence_checkbox.setChecked(
             self.get_steam_bool("use_presence_during_run")
@@ -2409,6 +2425,7 @@ class DashboardWindow(QMainWindow):
                 ("csgocases", self.enable_csgocases_checkbox),
                 ("bloodycase", self.enable_bloodycase_checkbox),
                 ("cs2free", self.enable_cs2free_checkbox),
+                ("g4skins", self.enable_g4skins_checkbox),
             )
             if checkbox.isChecked()
         ]

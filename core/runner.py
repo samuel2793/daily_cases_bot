@@ -13,6 +13,7 @@ from sites.bloodycase import BloodyCaseSite
 from sites.cs2free import CS2FreeSite
 from sites.csgocases import DEFAULT_URL as CSGOCASES_DEFAULT_URL
 from sites.csgocases import CSGOCasesSite
+from sites.g4skins import G4SkinsSite
 from sites.keydrop import KeyDropSite, load_session as load_storage_session, save_session
 from sites.steam import SteamAvatarManager
 from sites.steam_playtime import SteamPlaytimeMonitor, format_hours_and_minutes
@@ -66,6 +67,7 @@ class DailyCasesRunner:
         csgocases_result = "not_started"
         bloodycase_result = "not_started"
         cs2free_result = "not_started"
+        g4skins_result = "not_started"
         run_status = "completed"
         progress_rows = self.build_initial_progress_rows(enabled_sites)
         self.emit_progress(progress_rows)
@@ -122,6 +124,12 @@ class DailyCasesRunner:
                             "cs2free",
                             self.build_cs2free_site,
                         )
+                        self.logger.info("Inicializando bot para G4Skins.")
+                        g4skins_result = self.run_site(
+                            progress_rows,
+                            "g4skins",
+                            self.build_g4skins_site,
+                        )
                 else:
                     self.logger.info(
                         "Configuracion activa: se omite Presencia en Steam en esta ejecucion."
@@ -150,6 +158,12 @@ class DailyCasesRunner:
                         "cs2free",
                         self.build_cs2free_site,
                     )
+                    self.logger.info("Inicializando bot para G4Skins.")
+                    g4skins_result = self.run_site(
+                        progress_rows,
+                        "g4skins",
+                        self.build_g4skins_site,
+                    )
         except RunCancelled:
             run_status = "cancelled"
             self.mark_unfinished_sites_aborted(progress_rows)
@@ -165,6 +179,7 @@ class DailyCasesRunner:
                 bloodycase_result,
             )
             cs2free_result = self.read_site_result(progress_rows, "cs2free", cs2free_result)
+            g4skins_result = self.read_site_result(progress_rows, "g4skins", g4skins_result)
             self.logger.info(
                 "Ejecucion cancelada desde la interfaz. Se detuvo el flujo tras finalizar la web actual."
             )
@@ -191,7 +206,7 @@ class DailyCasesRunner:
                 )
             self.emit_progress(progress_rows)
             self.logger.info(
-                "Resumen final | Steam: %s | KeyDrop: %s | CSGOCases: %s | BloodyCase: %s | CS2.free: %s",
+                "Resumen final | Steam: %s | KeyDrop: %s | CSGOCases: %s | BloodyCase: %s | CS2.free: %s | G4Skins: %s",
                 format_hours_and_minutes(recent_hours)
                 if recent_hours is not None
                 else "sin comprobar",
@@ -199,6 +214,7 @@ class DailyCasesRunner:
                 csgocases_result,
                 bloodycase_result,
                 cs2free_result,
+                g4skins_result,
             )
 
         finished_at = datetime.now().astimezone()
@@ -210,6 +226,7 @@ class DailyCasesRunner:
                 "csgocases": csgocases_result,
                 "bloodycase": bloodycase_result,
                 "cs2free": cs2free_result,
+                "g4skins": g4skins_result,
             },
         )
         total_balance_value = self.calculate_total_balance(site_results)
@@ -410,6 +427,15 @@ class DailyCasesRunner:
             logger=logging.getLogger("daily_cases_bot.cs2free"),
         )
 
+    def build_g4skins_site(self) -> G4SkinsSite:
+        return G4SkinsSite(
+            session_file=self.paths.g4skins_session_file,
+            steam_session_file=self.paths.steam_session_file,
+            workspace_dir=self.paths.data_dir,
+            balances_file=self.paths.balances_file,
+            logger=logging.getLogger("daily_cases_bot.g4skins"),
+        )
+
     def prepare_site_session(self, site_name: str) -> str:
         normalized = site_name.strip().lower()
         if normalized == "steam":
@@ -422,11 +448,13 @@ class DailyCasesRunner:
             return self.prepare_bloodycase_session()
         if normalized == "cs2free":
             return self.prepare_cs2free_session()
+        if normalized == "g4skins":
+            return self.prepare_g4skins_session()
         raise ValueError(f"Sitio no soportado para preparacion: {site_name}")
 
     def prepare_all_sessions(self) -> list[str]:
         messages: list[str] = []
-        for site_name in ("steam", "keydrop", "csgocases", "bloodycase", "cs2free"):
+        for site_name in ("steam", "keydrop", "csgocases", "bloodycase", "cs2free", "g4skins"):
             try:
                 messages.append(self.prepare_site_session(site_name))
             except Exception as exc:
@@ -500,6 +528,23 @@ class DailyCasesRunner:
                 site.close()
                 site.playwright = None
 
+    def prepare_g4skins_session(self) -> str:
+        self.logger.info("Preparando sesion de G4Skins desde la interfaz.")
+        site = self.build_g4skins_site()
+        with sync_playwright() as playwright:
+            site.playwright = playwright
+            site._open_browser(playwright)
+            try:
+                site.open_home_page()
+                site.dismiss_cookie_banner()
+                site.ensure_authenticated()
+                site.dismiss_cookie_banner()
+                self.logger.info("Sesion de G4Skins preparada correctamente.")
+                return "G4Skins preparada correctamente."
+            finally:
+                site.close()
+                site.playwright = None
+
     def prepare_csgocases_session(self) -> str:
         self.logger.info("Preparando sesion de CSGOCases desde la interfaz.")
         site = self.build_csgocases_site()
@@ -558,11 +603,12 @@ class DailyCasesRunner:
             "keydrop": ("keydrop_daily_case", "keydrop_*.json"),
             "bloodycase": ("bloodycase_daily_free", "bloodycase_*.json"),
             "cs2free": ("cs2free_daily", "cs2free_*.json"),
+            "g4skins": ("g4skins_daily_case", "g4skins_*.json"),
         }
         balances_store = self.load_balances_store()
         results: list[SiteExecutionRecord] = []
 
-        for site_name in ("keydrop", "csgocases", "bloodycase", "cs2free"):
+        for site_name in ("keydrop", "csgocases", "bloodycase", "cs2free", "g4skins"):
             balance_payload = self.read_latest_balance_payload(balances_store, site_name)
             diagnostic_payload: dict[str, Any] | None = None
             diagnostic_path: Path | None = None
