@@ -13,6 +13,7 @@ from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QGridLayout,
     QGroupBox,
@@ -31,11 +32,13 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QSpinBox,
 )
 
 from core.history import HistoryStore
 from core.runner import DailyCasesRunner
 from core.runtime import RuntimePaths, configure_logging, ensure_runtime_dirs
+from core.settings import SITE_ORDER, SettingsStore, TAB_OPTIONS
 from interaction import PromptRequest, reset_interaction_provider, set_interaction_provider
 from services import SteamPresenceService
 from sites.steam import SteamAvatarManager
@@ -108,12 +111,14 @@ class RunnerThread(QThread):
         prompt_bridge: PromptBridge,
         log_handler: logging.Handler,
         presence_service: SteamPresenceService,
+        settings: dict[str, object],
     ) -> None:
         super().__init__()
         self.base_dir = base_dir
         self.prompt_bridge = prompt_bridge
         self.log_handler = log_handler
         self.presence_service = presence_service
+        self.settings = settings
         self._cancel_requested = threading.Event()
 
     def request_cancel(self) -> None:
@@ -134,6 +139,7 @@ class RunnerThread(QThread):
                 progress_callback=self.progress_updated.emit,
                 cancel_requested=self._cancel_requested.is_set,
                 steam_presence_service=self.presence_service,
+                settings=self.settings,
             )
             set_interaction_provider(QtInputProvider(self.prompt_bridge))
             set_steam_status_callback(self.steam_status_updated.emit)
@@ -234,11 +240,13 @@ class SteamRefreshThread(QThread):
         base_dir: Path,
         prompt_bridge: PromptBridge,
         log_handler: logging.Handler,
+        headless: bool,
     ) -> None:
         super().__init__()
         self.base_dir = base_dir
         self.prompt_bridge = prompt_bridge
         self.log_handler = log_handler
+        self.headless = headless
 
     def run(self) -> None:
         try:
@@ -255,8 +263,8 @@ class SteamRefreshThread(QThread):
                 workspace_dir=paths.data_dir,
                 data_file=paths.steam_playtime_file,
                 logger=logging.getLogger("daily_cases_bot.steam"),
-                headless=True,
-                slow_mo_ms=0,
+                headless=self.headless,
+                slow_mo_ms=0 if self.headless else 90,
             )
             recent_hours = playtime_monitor.check_recent_hours_once()
 
@@ -264,8 +272,8 @@ class SteamRefreshThread(QThread):
                 session_file=paths.steam_session_file,
                 workspace_dir=paths.data_dir,
                 logger=logging.getLogger("daily_cases_bot.steam"),
-                headless=True,
-                slow_mo_ms=0,
+                headless=self.headless,
+                slow_mo_ms=0 if self.headless else 90,
             )
             try:
                 steam_manager.start()
@@ -292,6 +300,8 @@ class DashboardWindow(QMainWindow):
         self.paths = RuntimePaths.from_base_dir(self.base_dir)
         ensure_runtime_dirs(self.paths)
         configure_steam_status_store(self.paths.steam_state_file)
+        self.settings_store = SettingsStore(self.paths.settings_file)
+        self.settings = self.settings_store.load()
         self.history_store = HistoryStore(self.paths.db_file)
         self.history_store.initialize()
 
@@ -316,13 +326,17 @@ class DashboardWindow(QMainWindow):
         self.diagnostic_rows: list[dict[str, object]] = []
         self.cancel_requested_in_ui = False
         self.setup_autofocus_done = False
+        self.has_non_ok_setup_status = False
 
         self.setWindowTitle("Daily Cases Bot")
-        self.resize(1360, 920)
+        self.resize(
+            self.get_interface_int("window_width"),
+            self.get_interface_int("window_height"),
+        )
         self._build_ui()
         self._wire_signals()
-        self.tabs.setCurrentWidget(self.dashboard_tab)
         self.refresh_dashboard()
+        self.apply_initial_tab_preference()
 
     def _build_ui(self) -> None:
         central_widget = QWidget(self)
@@ -582,8 +596,8 @@ class DashboardWindow(QMainWindow):
         dashboard_layout.addWidget(bottom_splitter, stretch=1)
         self.tabs.addTab(self.dashboard_tab, "Panel")
 
-        history_tab = QWidget()
-        history_layout = QVBoxLayout(history_tab)
+        self.history_tab = QWidget()
+        history_layout = QVBoxLayout(self.history_tab)
 
         self.runs_table = QTableWidget(0, 9)
         self.runs_table.setHorizontalHeaderLabels(
@@ -616,10 +630,10 @@ class DashboardWindow(QMainWindow):
         history_layout.addWidget(self.runs_table, stretch=1)
         history_layout.addWidget(self.run_detail_label)
         history_layout.addWidget(self.run_detail_preview, stretch=1)
-        self.tabs.addTab(history_tab, "Historico")
+        self.tabs.addTab(self.history_tab, "Historico")
 
-        diagnostics_tab = QWidget()
-        diagnostics_layout = QVBoxLayout(diagnostics_tab)
+        self.diagnostics_tab = QWidget()
+        diagnostics_layout = QVBoxLayout(self.diagnostics_tab)
 
         diagnostics_filters_layout = QHBoxLayout()
         diagnostics_filters_layout.addWidget(QLabel("Sitio"))
@@ -664,11 +678,103 @@ class DashboardWindow(QMainWindow):
         diagnostics_layout.addWidget(self.diagnostics_table, stretch=1)
         diagnostics_layout.addWidget(self.diagnostic_files_label)
         diagnostics_layout.addWidget(self.diagnostic_preview, stretch=1)
-        self.tabs.addTab(diagnostics_tab, "Diagnosticos")
+        self.tabs.addTab(self.diagnostics_tab, "Diagnosticos")
+
+        self.settings_tab = QWidget()
+        settings_layout = QVBoxLayout(self.settings_tab)
+
+        self.settings_summary_label = QLabel(
+            "Ajusta aqui el comportamiento del flujo, Steam, la interfaz y los listados."
+        )
+        self.settings_summary_label.setWordWrap(True)
+
+        settings_actions_layout = QHBoxLayout()
+        self.save_settings_button = QPushButton("Guardar configuracion")
+        self.reload_settings_button = QPushButton("Recargar desde disco")
+        self.reset_settings_button = QPushButton("Restaurar por defecto")
+        self.open_settings_file_button = QPushButton("Abrir settings.json")
+        settings_actions_layout.addWidget(self.save_settings_button)
+        settings_actions_layout.addWidget(self.reload_settings_button)
+        settings_actions_layout.addWidget(self.reset_settings_button)
+        settings_actions_layout.addWidget(self.open_settings_file_button)
+        settings_actions_layout.addStretch(1)
+
+        settings_groups_layout = QGridLayout()
+
+        flow_group = QGroupBox("Flujo")
+        flow_layout = QVBoxLayout(flow_group)
+        self.enable_keydrop_checkbox = QCheckBox("Ejecutar KeyDrop")
+        self.enable_csgocases_checkbox = QCheckBox("Ejecutar CSGOCases")
+        self.enable_bloodycase_checkbox = QCheckBox("Ejecutar BloodyCase")
+        self.enable_cs2free_checkbox = QCheckBox("Ejecutar CS2.free")
+        flow_layout.addWidget(self.enable_keydrop_checkbox)
+        flow_layout.addWidget(self.enable_csgocases_checkbox)
+        flow_layout.addWidget(self.enable_bloodycase_checkbox)
+        flow_layout.addWidget(self.enable_cs2free_checkbox)
+        flow_layout.addStretch(1)
+
+        steam_group_settings = QGroupBox("Steam")
+        steam_settings_layout = QVBoxLayout(steam_group_settings)
+        self.use_presence_checkbox = QCheckBox(
+            "Usar Presencia en Steam durante el flujo completo"
+        )
+        self.headless_refresh_checkbox = QCheckBox(
+            "Refrescar perfil de Steam en modo headless"
+        )
+        steam_settings_layout.addWidget(self.use_presence_checkbox)
+        steam_settings_layout.addWidget(self.headless_refresh_checkbox)
+        steam_settings_layout.addStretch(1)
+
+        interface_group_settings = QGroupBox("Interfaz")
+        interface_settings_layout = QGridLayout(interface_group_settings)
+        self.initial_tab_combo = QComboBox()
+        self.initial_tab_combo.addItems(TAB_OPTIONS)
+        self.remember_last_tab_checkbox = QCheckBox(
+            "Recordar la ultima pestaña abierta"
+        )
+        self.autofocus_setup_checkbox = QCheckBox(
+            "Ir a Primera ejecucion si hay elementos pendientes"
+        )
+        interface_settings_layout.addWidget(QLabel("Pestaña inicial"), 0, 0)
+        interface_settings_layout.addWidget(self.initial_tab_combo, 0, 1)
+        interface_settings_layout.addWidget(self.remember_last_tab_checkbox, 1, 0, 1, 2)
+        interface_settings_layout.addWidget(self.autofocus_setup_checkbox, 2, 0, 1, 2)
+
+        data_group_settings = QGroupBox("Datos")
+        data_settings_layout = QGridLayout(data_group_settings)
+        self.recent_activity_limit_spin = self._make_spin_box(10, 500)
+        self.runs_limit_spin = self._make_spin_box(10, 500)
+        self.diagnostics_limit_spin = self._make_spin_box(10, 500)
+        self.daily_totals_limit_spin = self._make_spin_box(7, 365)
+        self.diagnostic_preview_chars_spin = self._make_spin_box(1000, 100000, 1000)
+        data_settings_layout.addWidget(QLabel("Filas de actividad reciente"), 0, 0)
+        data_settings_layout.addWidget(self.recent_activity_limit_spin, 0, 1)
+        data_settings_layout.addWidget(QLabel("Filas de historico completo"), 1, 0)
+        data_settings_layout.addWidget(self.runs_limit_spin, 1, 1)
+        data_settings_layout.addWidget(QLabel("Filas de diagnosticos"), 2, 0)
+        data_settings_layout.addWidget(self.diagnostics_limit_spin, 2, 1)
+        data_settings_layout.addWidget(QLabel("Dias en acumulado diario"), 3, 0)
+        data_settings_layout.addWidget(self.daily_totals_limit_spin, 3, 1)
+        data_settings_layout.addWidget(QLabel("Caracteres de preview diagnostico"), 4, 0)
+        data_settings_layout.addWidget(self.diagnostic_preview_chars_spin, 4, 1)
+
+        settings_groups_layout.addWidget(flow_group, 0, 0)
+        settings_groups_layout.addWidget(steam_group_settings, 0, 1)
+        settings_groups_layout.addWidget(interface_group_settings, 1, 0)
+        settings_groups_layout.addWidget(data_group_settings, 1, 1)
+        settings_groups_layout.setColumnStretch(0, 1)
+        settings_groups_layout.setColumnStretch(1, 1)
+
+        settings_layout.addWidget(self.settings_summary_label)
+        settings_layout.addLayout(settings_actions_layout)
+        settings_layout.addLayout(settings_groups_layout)
+        settings_layout.addStretch(1)
+        self.tabs.addTab(self.settings_tab, "Configuracion")
 
         exit_action = QAction("Salir", self)
         exit_action.triggered.connect(self.close)
         self.addAction(exit_action)
+        self.load_settings_into_controls()
         self.update_diagnostics_actions()
 
     def _wire_signals(self) -> None:
@@ -725,6 +831,13 @@ class DashboardWindow(QMainWindow):
         self.open_diagnostic_json_button.clicked.connect(
             lambda: self.open_selected_diagnostic_file("json")
         )
+        self.save_settings_button.clicked.connect(self.save_settings_from_controls)
+        self.reload_settings_button.clicked.connect(self.reload_settings_from_disk)
+        self.reset_settings_button.clicked.connect(self.reset_settings_to_defaults)
+        self.open_settings_file_button.clicked.connect(
+            lambda: self.open_local_path(self.paths.settings_file)
+        )
+        self.tabs.currentChanged.connect(self.on_tab_changed)
         self.update_steam_panel(get_steam_status_snapshot())
 
     def _make_value_label(self, text: str) -> QLabel:
@@ -748,6 +861,17 @@ class DashboardWindow(QMainWindow):
             ]
         )
         return font
+
+    def _make_spin_box(
+        self,
+        minimum: int,
+        maximum: int,
+        step: int = 1,
+    ) -> QSpinBox:
+        spin_box = QSpinBox()
+        spin_box.setRange(minimum, maximum)
+        spin_box.setSingleStep(step)
+        return spin_box
 
     def _steam_badge_style(self, background: str, foreground: str) -> str:
         return (
@@ -814,8 +938,7 @@ class DashboardWindow(QMainWindow):
         self.cancel_button.setText("Cancelar ejecucion")
         self.cancel_requested_in_ui = False
         self.current_run_progress = {
-            site_name: {"site_name": site_name, "phase": "Pendiente", "result": "-"}
-            for site_name in ("keydrop", "csgocases", "bloodycase", "cs2free")
+            row["site_name"]: row for row in self.build_initial_progress_state()
         }
         self.refresh_dashboard()
         self.runner_thread = RunnerThread(
@@ -823,6 +946,7 @@ class DashboardWindow(QMainWindow):
             self.prompt_bridge,
             self.log_handler,
             self.presence_service,
+            self.settings,
         )
         self.runner_thread.run_finished.connect(self.on_run_finished)
         self.runner_thread.run_failed.connect(self.on_run_failed)
@@ -961,6 +1085,7 @@ class DashboardWindow(QMainWindow):
             self.base_dir,
             self.prompt_bridge,
             self.log_handler,
+            self.get_steam_bool("headless_profile_refresh"),
         )
         self.steam_refresh_thread.refresh_finished.connect(self.on_steam_refresh_finished)
         self.steam_refresh_thread.refresh_failed.connect(self.on_steam_refresh_failed)
@@ -1079,7 +1204,9 @@ class DashboardWindow(QMainWindow):
         }
         self.refresh_site_table(latest_site_rows)
 
-        daily_rows = self.history_store.get_daily_totals(30)
+        daily_rows = self.history_store.get_daily_totals(
+            self.get_interface_int("daily_totals_limit")
+        )
         self.daily_table.setRowCount(len(daily_rows))
         for row_index, row in enumerate(daily_rows):
             self.set_table_item(self.daily_table, row_index, 0, str(row["day"]))
@@ -1090,7 +1217,9 @@ class DashboardWindow(QMainWindow):
                 self.format_amount(row["total"]),
             )
 
-        recent_rows = self.history_store.get_recent_site_results(40)
+        recent_rows = self.history_store.get_recent_site_results(
+            self.get_interface_int("recent_activity_limit")
+        )
         self.recent_table.setRowCount(len(recent_rows))
         for row_index, row in enumerate(recent_rows):
             self.set_table_item(
@@ -1150,6 +1279,7 @@ class DashboardWindow(QMainWindow):
                 blocking_issues.append(f"{element}: {detail}")
 
         has_non_ok_status = any(str(check["status"]) != "OK" for check in checks)
+        self.has_non_ok_setup_status = has_non_ok_status
 
         if blocking_issues:
             self.setup_summary_label.setText(
@@ -1176,7 +1306,11 @@ class DashboardWindow(QMainWindow):
                 "Todas las sesiones detectadas tienen un archivo guardado. Si alguna web expira, la app pedira login manual solo para esa web."
             )
 
-        if has_non_ok_status and not self.setup_autofocus_done:
+        if (
+            has_non_ok_status
+            and self.get_interface_bool("auto_focus_setup_on_issues")
+            and not self.setup_autofocus_done
+        ):
             self.tabs.setCurrentWidget(self.setup_tab)
             self.setup_autofocus_done = True
 
@@ -1263,6 +1397,8 @@ class DashboardWindow(QMainWindow):
                 status_item.setBackground(QColor("#f28b82"))
             elif result == "account_setup_required":
                 status_item.setBackground(QColor("#f6c177"))
+            elif result == "disabled":
+                status_item.setBackground(QColor("#eeeeee"))
             else:
                 status_item.setBackground(QColor("#a9e5b0"))
 
@@ -1419,7 +1555,9 @@ class DashboardWindow(QMainWindow):
 
     def refresh_runs_table(self) -> None:
         previous_row_index = self.runs_table.currentRow()
-        self.run_history_rows = self.history_store.get_recent_runs(40)
+        self.run_history_rows = self.history_store.get_recent_runs(
+            self.get_interface_int("runs_limit")
+        )
         self.runs_table.setRowCount(len(self.run_history_rows))
 
         for row_index, run_row in enumerate(self.run_history_rows):
@@ -1612,7 +1750,9 @@ class DashboardWindow(QMainWindow):
         previous_row_index = self.diagnostics_table.currentRow()
         previous_site = self.diagnostic_site_filter.currentText()
         previous_date = self.diagnostic_date_filter.currentText()
-        self.all_diagnostic_rows = self.history_store.get_recent_diagnostics(80)
+        self.all_diagnostic_rows = self.history_store.get_recent_diagnostics(
+            self.get_interface_int("diagnostics_limit")
+        )
         self.populate_diagnostic_filters(previous_site, previous_date)
         self.apply_diagnostic_filters(previous_row_index)
 
@@ -1764,7 +1904,9 @@ class DashboardWindow(QMainWindow):
             except Exception as exc:
                 preview_text = f"No se pudo leer {preview_path.name}: {exc}"
 
-        self.diagnostic_preview.setPlainText(preview_text[:12_000])
+        self.diagnostic_preview.setPlainText(
+            preview_text[: self.get_data_int("diagnostic_preview_chars")]
+        )
         self.update_diagnostics_actions()
 
     def update_diagnostics_actions(self) -> None:
@@ -1903,6 +2045,221 @@ class DashboardWindow(QMainWindow):
             self.prompt_bridge.submit_answer("q")
             return
         self.prompt_bridge.submit_answer(text)
+
+    def load_settings_into_controls(self) -> None:
+        enabled_sites = set(self.get_enabled_sites())
+        self.enable_keydrop_checkbox.setChecked("keydrop" in enabled_sites)
+        self.enable_csgocases_checkbox.setChecked("csgocases" in enabled_sites)
+        self.enable_bloodycase_checkbox.setChecked("bloodycase" in enabled_sites)
+        self.enable_cs2free_checkbox.setChecked("cs2free" in enabled_sites)
+
+        self.use_presence_checkbox.setChecked(
+            self.get_steam_bool("use_presence_during_run")
+        )
+        self.headless_refresh_checkbox.setChecked(
+            self.get_steam_bool("headless_profile_refresh")
+        )
+
+        self.initial_tab_combo.setCurrentText(self.get_interface_str("initial_tab"))
+        self.remember_last_tab_checkbox.setChecked(
+            self.get_interface_bool("remember_last_tab")
+        )
+        self.autofocus_setup_checkbox.setChecked(
+            self.get_interface_bool("auto_focus_setup_on_issues")
+        )
+
+        self.recent_activity_limit_spin.setValue(
+            self.get_interface_int("recent_activity_limit")
+        )
+        self.runs_limit_spin.setValue(self.get_interface_int("runs_limit"))
+        self.diagnostics_limit_spin.setValue(
+            self.get_interface_int("diagnostics_limit")
+        )
+        self.daily_totals_limit_spin.setValue(
+            self.get_interface_int("daily_totals_limit")
+        )
+        self.diagnostic_preview_chars_spin.setValue(
+            self.get_data_int("diagnostic_preview_chars")
+        )
+
+    def collect_settings_from_controls(self) -> dict[str, object]:
+        enabled_sites = [
+            site_name
+            for site_name, checkbox in (
+                ("keydrop", self.enable_keydrop_checkbox),
+                ("csgocases", self.enable_csgocases_checkbox),
+                ("bloodycase", self.enable_bloodycase_checkbox),
+                ("cs2free", self.enable_cs2free_checkbox),
+            )
+            if checkbox.isChecked()
+        ]
+        if not enabled_sites:
+            enabled_sites = list(SITE_ORDER)
+
+        current_width = max(self.width(), 900)
+        current_height = max(self.height(), 700)
+        last_tab = self.tabs.tabText(self.tabs.currentIndex()) or "Panel"
+
+        return {
+            "flow": {
+                "enabled_sites": enabled_sites,
+            },
+            "steam": {
+                "use_presence_during_run": self.use_presence_checkbox.isChecked(),
+                "headless_profile_refresh": self.headless_refresh_checkbox.isChecked(),
+            },
+            "interface": {
+                "initial_tab": self.initial_tab_combo.currentText() or "Panel",
+                "auto_focus_setup_on_issues": self.autofocus_setup_checkbox.isChecked(),
+                "remember_last_tab": self.remember_last_tab_checkbox.isChecked(),
+                "last_tab": last_tab,
+                "recent_activity_limit": self.recent_activity_limit_spin.value(),
+                "runs_limit": self.runs_limit_spin.value(),
+                "diagnostics_limit": self.diagnostics_limit_spin.value(),
+                "daily_totals_limit": self.daily_totals_limit_spin.value(),
+                "window_width": current_width,
+                "window_height": current_height,
+            },
+            "data": {
+                "diagnostic_preview_chars": self.diagnostic_preview_chars_spin.value(),
+            },
+        }
+
+    def save_settings_from_controls(self) -> None:
+        self.settings = self.settings_store.normalize(self.collect_settings_from_controls())
+        self.settings_store.save(self.settings)
+        self.load_settings_into_controls()
+        self.refresh_dashboard()
+        self.append_log("Configuracion guardada.")
+        QMessageBox.information(
+            self,
+            "Configuracion guardada",
+            "La configuracion se ha guardado y ya esta aplicada.",
+        )
+
+    def reload_settings_from_disk(self) -> None:
+        self.settings = self.settings_store.load()
+        self.load_settings_into_controls()
+        self.resize(
+            self.get_interface_int("window_width"),
+            self.get_interface_int("window_height"),
+        )
+        self.refresh_dashboard()
+        self.append_log("Configuracion recargada desde disco.")
+
+    def reset_settings_to_defaults(self) -> None:
+        self.settings = self.settings_store.reset()
+        self.load_settings_into_controls()
+        self.resize(
+            self.get_interface_int("window_width"),
+            self.get_interface_int("window_height"),
+        )
+        self.refresh_dashboard()
+        self.append_log("Configuracion restaurada a valores por defecto.")
+        QMessageBox.information(
+            self,
+            "Configuracion restaurada",
+            "Se han restaurado los valores por defecto.",
+        )
+
+    def build_initial_progress_state(self) -> list[dict[str, str]]:
+        enabled_sites = set(self.get_enabled_sites())
+        rows: list[dict[str, str]] = []
+        for site_name in SITE_ORDER:
+            if site_name in enabled_sites:
+                rows.append({"site_name": site_name, "phase": "Pendiente", "result": "-"})
+            else:
+                rows.append(
+                    {"site_name": site_name, "phase": "Hecho", "result": "disabled"}
+                )
+        return rows
+
+    def get_enabled_sites(self) -> list[str]:
+        flow_settings = self.settings.get("flow")
+        if not isinstance(flow_settings, dict):
+            return list(SITE_ORDER)
+        enabled_sites = flow_settings.get("enabled_sites")
+        if not isinstance(enabled_sites, list):
+            return list(SITE_ORDER)
+        normalized = [str(site).strip().lower() for site in enabled_sites]
+        selected = [site for site in SITE_ORDER if site in normalized]
+        return selected or list(SITE_ORDER)
+
+    def get_steam_bool(self, key: str) -> bool:
+        steam_settings = self.settings.get("steam")
+        if not isinstance(steam_settings, dict):
+            return False
+        return bool(steam_settings.get(key))
+
+    def get_interface_bool(self, key: str) -> bool:
+        interface_settings = self.settings.get("interface")
+        if not isinstance(interface_settings, dict):
+            return False
+        return bool(interface_settings.get(key))
+
+    def get_interface_int(self, key: str) -> int:
+        interface_settings = self.settings.get("interface")
+        if not isinstance(interface_settings, dict):
+            return 0
+        value = interface_settings.get(key)
+        return int(value) if isinstance(value, int) else 0
+
+    def get_interface_str(self, key: str) -> str:
+        interface_settings = self.settings.get("interface")
+        if not isinstance(interface_settings, dict):
+            return ""
+        value = interface_settings.get(key)
+        return str(value) if value is not None else ""
+
+    def get_data_int(self, key: str) -> int:
+        data_settings = self.settings.get("data")
+        if not isinstance(data_settings, dict):
+            return 0
+        value = data_settings.get(key)
+        return int(value) if isinstance(value, int) else 0
+
+    def get_tab_widget_by_name(self, tab_name: str) -> QWidget:
+        mapping = {
+            "Panel": self.dashboard_tab,
+            "Primera ejecucion": self.setup_tab,
+            "Historico": self.history_tab,
+            "Diagnosticos": self.diagnostics_tab,
+            "Configuracion": self.settings_tab,
+        }
+        return mapping.get(tab_name, self.dashboard_tab)
+
+    def apply_initial_tab_preference(self) -> None:
+        if self.has_non_ok_setup_status and self.get_interface_bool(
+            "auto_focus_setup_on_issues"
+        ):
+            self.tabs.setCurrentWidget(self.setup_tab)
+            return
+
+        if self.get_interface_bool("remember_last_tab"):
+            tab_name = self.get_interface_str("last_tab") or "Panel"
+        else:
+            tab_name = self.get_interface_str("initial_tab") or "Panel"
+        self.tabs.setCurrentWidget(self.get_tab_widget_by_name(tab_name))
+
+    def on_tab_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        if not self.get_interface_bool("remember_last_tab"):
+            return
+        current_tab = self.tabs.tabText(index)
+        interface_settings = dict(self.settings.get("interface") or {})
+        interface_settings["last_tab"] = current_tab
+        self.settings["interface"] = interface_settings
+        self.settings_store.save(self.settings)
+
+    def closeEvent(self, event) -> None:
+        interface_settings = dict(self.settings.get("interface") or {})
+        interface_settings["window_width"] = max(self.width(), 900)
+        interface_settings["window_height"] = max(self.height(), 700)
+        interface_settings["last_tab"] = self.tabs.tabText(self.tabs.currentIndex()) or "Panel"
+        self.settings["interface"] = interface_settings
+        self.settings_store.save(self.settings)
+        super().closeEvent(event)
 
     def set_table_item(
         self,

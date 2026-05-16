@@ -20,6 +20,7 @@ from sites.steam_playtime import SteamPlaytimeMonitor, format_hours_and_minutes
 from .history import HistoryStore
 from .models import ExecutionSummary, SiteExecutionRecord
 from .runtime import RuntimePaths
+from .settings import SITE_ORDER
 
 
 class RunCancelled(Exception):
@@ -35,6 +36,7 @@ class DailyCasesRunner:
         progress_callback: Callable[[list[dict[str, str]]], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
         steam_presence_service: SteamPresenceService | None = None,
+        settings: dict[str, Any] | None = None,
     ) -> None:
         self.paths = paths
         self.logger = logger
@@ -42,6 +44,7 @@ class DailyCasesRunner:
         self.progress_callback = progress_callback
         self.cancel_requested = cancel_requested
         self.steam_presence_service = steam_presence_service
+        self.settings = settings or {}
 
     def run(self) -> ExecutionSummary:
         started_at = datetime.now().astimezone()
@@ -56,6 +59,7 @@ class DailyCasesRunner:
             logger=logging.getLogger("daily_cases_bot.steam_presence"),
         )
         presence_started_by_runner = False
+        enabled_sites = self.get_enabled_sites()
 
         recent_hours: float | None = None
         keydrop_result = "not_started"
@@ -63,7 +67,7 @@ class DailyCasesRunner:
         bloodycase_result = "not_started"
         cs2free_result = "not_started"
         run_status = "completed"
-        progress_rows = self.build_initial_progress_rows()
+        progress_rows = self.build_initial_progress_rows(enabled_sites)
         self.emit_progress(progress_rows)
 
         self.logger.info("Comprobando requisito previo de horas recientes en Steam.")
@@ -84,15 +88,44 @@ class DailyCasesRunner:
                 )
                 run_status = "blocked_by_steam_hours"
             else:
-                if not steam_presence.is_running():
-                    steam_presence.start()
-                    presence_started_by_runner = True
-                if not steam_presence.wait_until_ready():
-                    self.logger.warning(
-                        "Steam Presence no quedo listo. Revisa el login/2FA y vuelve a ejecutar."
-                    )
-                    run_status = "steam_presence_not_ready"
+                if self.use_presence_during_run():
+                    if not steam_presence.is_running():
+                        steam_presence.start()
+                        presence_started_by_runner = True
+                    if not steam_presence.wait_until_ready():
+                        self.logger.warning(
+                            "Steam Presence no quedo listo. Revisa el login/2FA y vuelve a ejecutar."
+                        )
+                        run_status = "steam_presence_not_ready"
+                    else:
+                        keydrop_result = self.run_site(
+                            progress_rows,
+                            "keydrop",
+                            self.build_keydrop_site,
+                        )
+                        self.logger.info("KeyDrop finalizo con estado: %s", keydrop_result)
+                        self.logger.info("Inicializando bot para CSGOCases.")
+                        csgocases_result = self.run_site(
+                            progress_rows,
+                            "csgocases",
+                            self.build_csgocases_site,
+                        )
+                        self.logger.info("Inicializando bot para BloodyCase.")
+                        bloodycase_result = self.run_site(
+                            progress_rows,
+                            "bloodycase",
+                            self.build_bloodycase_site,
+                        )
+                        self.logger.info("Inicializando bot para CS2.free.")
+                        cs2free_result = self.run_site(
+                            progress_rows,
+                            "cs2free",
+                            self.build_cs2free_site,
+                        )
                 else:
+                    self.logger.info(
+                        "Configuracion activa: se omite Presencia en Steam en esta ejecucion."
+                    )
                     keydrop_result = self.run_site(
                         progress_rows,
                         "keydrop",
@@ -198,6 +231,9 @@ class DailyCasesRunner:
         site_name: str,
         builder: Callable[[], Any],
     ) -> str:
+        if not self.is_site_enabled(site_name):
+            self.mark_site_completed(progress_rows, site_name, "disabled")
+            return "disabled"
         self.raise_if_cancelled(progress_rows)
         self.mark_site_in_progress(progress_rows, site_name)
         result = str(builder().run())
@@ -230,13 +266,38 @@ class DailyCasesRunner:
                     "No se pudo cerrar SteamAvatarManager tras capturar el snapshot inicial de Steam."
                 )
 
-    def build_initial_progress_rows(self) -> list[dict[str, str]]:
-        return [
-            {"site_name": "keydrop", "phase": "Pendiente", "result": "-"},
-            {"site_name": "csgocases", "phase": "Pendiente", "result": "-"},
-            {"site_name": "bloodycase", "phase": "Pendiente", "result": "-"},
-            {"site_name": "cs2free", "phase": "Pendiente", "result": "-"},
-        ]
+    def build_initial_progress_rows(
+        self,
+        enabled_sites: list[str] | None = None,
+    ) -> list[dict[str, str]]:
+        active_sites = enabled_sites if enabled_sites is not None else self.get_enabled_sites()
+        rows: list[dict[str, str]] = []
+        for site_name in SITE_ORDER:
+            if site_name in active_sites:
+                rows.append({"site_name": site_name, "phase": "Pendiente", "result": "-"})
+            else:
+                rows.append({"site_name": site_name, "phase": "Hecho", "result": "disabled"})
+        return rows
+
+    def get_enabled_sites(self) -> list[str]:
+        flow_settings = self.settings.get("flow")
+        if not isinstance(flow_settings, dict):
+            return list(SITE_ORDER)
+        enabled_sites = flow_settings.get("enabled_sites")
+        if not isinstance(enabled_sites, list):
+            return list(SITE_ORDER)
+        normalized = [str(site).strip().lower() for site in enabled_sites]
+        selected = [site for site in SITE_ORDER if site in normalized]
+        return selected or list(SITE_ORDER)
+
+    def is_site_enabled(self, site_name: str) -> bool:
+        return site_name.strip().lower() in self.get_enabled_sites()
+
+    def use_presence_during_run(self) -> bool:
+        steam_settings = self.settings.get("steam")
+        if not isinstance(steam_settings, dict):
+            return True
+        return bool(steam_settings.get("use_presence_during_run", True))
 
     def mark_site_in_progress(
         self,

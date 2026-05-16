@@ -14,6 +14,7 @@ class RuntimePaths:
     data_dir: Path
     log_file: Path
     db_file: Path
+    settings_file: Path
     steam_state_file: Path
     balances_file: Path
     steam_playtime_file: Path
@@ -41,6 +42,7 @@ class RuntimePaths:
             data_dir=data_dir,
             log_file=logs_dir / "bot.log",
             db_file=data_dir / "app.db",
+            settings_file=data_dir / "settings.json",
             steam_state_file=data_dir / "steam_state.json",
             balances_file=data_dir / "balances.json",
             steam_playtime_file=data_dir / "steam_playtime.json",
