@@ -38,6 +38,10 @@ CLAIM_BUTTON_TEXT_XPATH = (
 LOGIN_PATTERN = re.compile(r"(iniciar sesi[oó]n|login|sign in|steam)", re.IGNORECASE)
 CLAIM_PATTERN = re.compile(r"\bclaim\b", re.IGNORECASE)
 SELL_PATTERN = re.compile(r"(vender|sell)", re.IGNORECASE)
+RAFFLE_BUTTON_PATTERN = re.compile(
+    r"(participar en sorteos|participar en sorteo|join giveaways|giveaways?)",
+    re.IGNORECASE,
+)
 WEAPON_REWARD_PATTERN = re.compile(
     r"\b("
     r"ak-47|m4a1-s|m4a4|awp|usp-s|glock-18|deagle|desert eagle|p250|famas|galil|galil ar|"
@@ -504,9 +508,15 @@ class BloodyCaseSite:
         self.human_delay(12.0, 15.0)
         while True:
             reward_candidates = self.collect_visible_text_candidates()
-            reward_text = self.infer_reward_text(reward_candidates)
-            reward_kind = self.infer_reward_kind(reward_text)
             visible_buttons_before_sell = self.collect_visible_button_texts()
+            reward_text = self.infer_reward_text(
+                reward_candidates,
+                visible_buttons_before_sell,
+            )
+            reward_kind = self.infer_reward_kind(
+                reward_text,
+                visible_buttons_before_sell,
+            )
             body_text = self.try_read_body_text()
             sell_button_text_probe = self.find_sell_button_text()
 
@@ -832,7 +842,15 @@ class BloodyCaseSite:
             candidates.append(candidate)
         return candidates
 
-    def infer_reward_text(self, candidates: list[dict[str, Any]]) -> str | None:
+    def infer_reward_text(
+        self,
+        candidates: list[dict[str, Any]],
+        visible_buttons: list[str] | None = None,
+    ) -> str | None:
+        raffle_reward = self.infer_raffle_reward_text(candidates, visible_buttons or [])
+        if raffle_reward:
+            return raffle_reward
+
         filtered: list[dict[str, Any]] = []
         for candidate in candidates:
             text = str(candidate.get("text", "")).strip()
@@ -860,9 +878,99 @@ class BloodyCaseSite:
         )
         return str(filtered[0].get("text", "")).strip() or None
 
-    def infer_reward_kind(self, reward_text: str | None) -> str:
+    def infer_raffle_reward_text(
+        self,
+        candidates: list[dict[str, Any]],
+        visible_buttons: list[str],
+    ) -> str | None:
+        raffle_button_texts = [
+            text for text in visible_buttons if RAFFLE_BUTTON_PATTERN.search(text)
+        ]
+        if not raffle_button_texts:
+            return None
+
+        raffle_button = raffle_button_texts[0]
+        button_candidates = [
+            candidate
+            for candidate in candidates
+            if self.compact_text(str(candidate.get("text", ""))) == self.compact_text(raffle_button)
+        ]
+        if not button_candidates:
+            return None
+
+        button_candidate = button_candidates[0]
+        button_x = float(button_candidate.get("x", 0) or 0)
+        button_y = float(button_candidate.get("y", 0) or 0)
+        button_width = float(button_candidate.get("width", 0) or 0)
+        button_center_x = button_x + (button_width / 2)
+
+        reward_candidates: list[dict[str, Any]] = []
+        for candidate in candidates:
+            text = str(candidate.get("text", "")).strip()
+            if not text:
+                continue
+            if len(text) > 80:
+                continue
+            if self.is_generic_reward_text(text):
+                continue
+            if GENERIC_UI_TEXT_PATTERN.search(text):
+                continue
+            if RAFFLE_BUTTON_PATTERN.search(text):
+                continue
+            if re.fullmatch(r"[\d\s.,:$€£-]+", text):
+                continue
+
+            candidate_x = float(candidate.get("x", 0) or 0)
+            candidate_y = float(candidate.get("y", 0) or 0)
+            candidate_width = float(candidate.get("width", 0) or 0)
+            candidate_center_x = candidate_x + (candidate_width / 2)
+
+            if candidate_y >= button_y:
+                continue
+            if button_y - candidate_y > 420:
+                continue
+            if abs(candidate_center_x - button_center_x) > 240:
+                continue
+
+            reward_candidates.append(candidate)
+
+        if not reward_candidates:
+            return None
+
+        preferred = [
+            candidate
+            for candidate in reward_candidates
+            if "|" in str(candidate.get("text", ""))
+        ]
+        if preferred:
+            reward_candidates = preferred
+
+        reward_candidates.sort(
+            key=lambda item: (
+                abs(
+                    (
+                        float(item.get("x", 0) or 0)
+                        + (float(item.get("width", 0) or 0) / 2)
+                    )
+                    - button_center_x
+                ),
+                abs(button_y - float(item.get("y", 0) or 0)),
+                -float(item.get("fontSize", 0) or 0),
+            )
+        )
+        return str(reward_candidates[0].get("text", "")).strip() or None
+
+    def infer_reward_kind(
+        self,
+        reward_text: str | None,
+        visible_buttons: list[str] | None = None,
+    ) -> str:
         if not reward_text:
             return "unknown"
+        if visible_buttons and any(
+            RAFFLE_BUTTON_PATTERN.search(text) for text in visible_buttons
+        ):
+            return "raffle"
         if WEAPON_REWARD_PATTERN.search(reward_text):
             return "skin"
         return "unknown"
