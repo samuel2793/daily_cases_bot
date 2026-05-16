@@ -1,161 +1,61 @@
 from __future__ import annotations
 
-import logging
+import argparse
 import sys
 from pathlib import Path
 
-from services import SteamPresenceService
-from sites.bloodycase import BloodyCaseSite
-from sites.cs2free import CS2FreeSite
-from sites.csgocases import CSGOCasesSite
-from sites.keydrop import KeyDropSite
-from sites.steam_playtime import SteamPlaytimeMonitor, format_hours_and_minutes
+from core import (
+    ConsoleInputProvider,
+    DailyCasesRunner,
+    HistoryStore,
+    PatchedInput,
+    RuntimePaths,
+    configure_logging,
+    ensure_runtime_dirs,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
-SESSIONS_DIR = BASE_DIR / "sessions"
-LOGS_DIR = BASE_DIR / "logs"
-DATA_DIR = BASE_DIR / "data"
-LOG_FILE = LOGS_DIR / "bot.log"
-
-
-def ensure_runtime_dirs() -> None:
-    for directory in (SESSIONS_DIR, LOGS_DIR, DATA_DIR):
-        directory.mkdir(parents=True, exist_ok=True)
-
-
-def configure_logging() -> logging.Logger:
-    logger = logging.getLogger("daily_cases_bot")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    if logger.handlers:
-        return logger
-
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
-    )
-
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-
-    logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
-    return logger
 
 
 def main() -> None:
-    ensure_runtime_dirs()
-    logger = configure_logging()
-    bloodycase_session_file = SESSIONS_DIR / "bloodycase_session.json"
-    cs2free_session_file = SESSIONS_DIR / "cs2free_session.json"
-    csgocases_session_file = SESSIONS_DIR / "csgocases_session.json"
-    session_file = SESSIONS_DIR / "session.json"
-    steam_session_file = SESSIONS_DIR / "steam_session.json"
-    balances_file = DATA_DIR / "balances.json"
-    steam_playtime_file = DATA_DIR / "steam_playtime.json"
-    bloodycase_steam_avatar_file = BASE_DIR / "images" / "bloodycase.png"
-    keydrop_steam_avatar_file = BASE_DIR / "images" / "keydrop.webp"
-    csgocases_steam_avatar_file = BASE_DIR / "images" / "csgocases.png"
-    steam_presence_script = BASE_DIR / "cs2.js"
-
-    logger.info("Comprobando requisito previo de horas recientes en Steam.")
-    playtime_monitor = SteamPlaytimeMonitor(
-        session_file=steam_session_file,
-        workspace_dir=DATA_DIR,
-        data_file=steam_playtime_file,
-        logger=logging.getLogger("daily_cases_bot.steam"),
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Ejecuta el flujo en modo consola en lugar de abrir la interfaz.",
     )
-    steam_presence = SteamPresenceService(
-        script_path=steam_presence_script,
-        logger=logging.getLogger("daily_cases_bot.steam_presence"),
-    )
+    args = parser.parse_args()
 
-    logger.info("Inicializando bot para KeyDrop.")
-    site = KeyDropSite(
-        session_file=session_file,
-        steam_session_file=steam_session_file,
-        steam_avatar_file=keydrop_steam_avatar_file,
-        steam_workspace_dir=DATA_DIR,
-        balances_file=balances_file,
-        logger=logging.getLogger("daily_cases_bot.keydrop"),
-    )
-    keydrop_result = "not_started"
-    csgocases_result = "not_started"
-    bloodycase_result = "not_started"
-    cs2free_result = "not_started"
+    if args.cli:
+        run_cli()
+        return
 
+    run_gui()
+
+
+def run_cli() -> None:
+    paths = RuntimePaths.from_base_dir(BASE_DIR)
+    ensure_runtime_dirs(paths)
+    logger = configure_logging(paths.log_file)
+    history_store = HistoryStore(paths.db_file)
+    history_store.initialize()
+    runner = DailyCasesRunner(paths, logger, history_store=history_store)
+    with PatchedInput(ConsoleInputProvider()):
+        runner.run()
+
+
+def run_gui() -> None:
     try:
-        recent_hours = playtime_monitor.check_recent_hours_once()
-        if recent_hours < playtime_monitor.minimum_hours:
-            logger.warning(
-                "Counter-Strike 2 no cumple el requisito: %s / %s en las ultimas 2 semanas. "
-                "Cierro el programa sin ejecutar KeyDrop.",
-                format_hours_and_minutes(recent_hours),
-                format_hours_and_minutes(playtime_monitor.minimum_hours),
-            )
-            return
-        steam_presence.start()
-        if not steam_presence.wait_until_ready():
-            logger.warning(
-                "Steam Presence no quedo listo. Revisa el login/2FA y vuelve a ejecutar."
-            )
-            return
+        from ui import launch_app
+    except ModuleNotFoundError as exc:
+        print(
+            "No se pudo iniciar la interfaz porque falta una dependencia gráfica. "
+            "Instala requirements.txt o ejecuta 'python3 main.py --cli'.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
 
-        keydrop_result = site.run()
-        logger.info("KeyDrop finalizo con estado: %s", keydrop_result)
-        logger.info("Inicializando bot para CSGOCases.")
-        csgocases_site = CSGOCasesSite(
-            session_file=csgocases_session_file,
-            steam_session_file=steam_session_file,
-            steam_avatar_file=csgocases_steam_avatar_file,
-            steam_workspace_dir=DATA_DIR,
-            balances_file=balances_file,
-            logger=logging.getLogger("daily_cases_bot.csgocases"),
-        )
-        csgocases_result = csgocases_site.run()
-        logger.info("Inicializando bot para BloodyCase.")
-        bloodycase_site = BloodyCaseSite(
-            session_file=bloodycase_session_file,
-            steam_session_file=steam_session_file,
-            steam_avatar_file=bloodycase_steam_avatar_file,
-            balances_file=balances_file,
-            workspace_dir=DATA_DIR,
-            logger=logging.getLogger("daily_cases_bot.bloodycase"),
-        )
-        bloodycase_result = bloodycase_site.run()
-        logger.info("Inicializando bot para CS2.free.")
-        cs2free_site = CS2FreeSite(
-            session_file=cs2free_session_file,
-            workspace_dir=DATA_DIR,
-            logger=logging.getLogger("daily_cases_bot.cs2free"),
-        )
-        cs2free_result = cs2free_site.run()
-    except KeyboardInterrupt:
-        logger.info("Ejecucion interrumpida por el usuario.")
-    except Exception:
-        logger.exception("Error no controlado en main.")
-        try:
-            input("El proceso sigue vivo. Pulsa Enter para cerrar.")
-        except KeyboardInterrupt:
-            logger.info("Cierre forzado por el usuario.")
-    finally:
-        try:
-            steam_presence.stop()
-        except KeyboardInterrupt:
-            logger.info("Cierre interrumpido por el usuario mientras se detenia Steam Presence.")
-        logger.info(
-            "Resumen final | Steam: %s | KeyDrop: %s | CSGOCases: %s | BloodyCase: %s | CS2.free: %s",
-            format_hours_and_minutes(recent_hours)
-            if "recent_hours" in locals()
-            else "sin comprobar",
-            keydrop_result,
-            csgocases_result,
-            bloodycase_result,
-            cs2free_result,
-        )
+    raise SystemExit(launch_app(BASE_DIR))
 
 
 if __name__ == "__main__":
