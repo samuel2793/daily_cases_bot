@@ -24,8 +24,15 @@ from .keydrop import load_session, save_session
 
 DEFAULT_URL = "https://cs2.free/free-cases/"
 SITE_NAME = "cs2free"
+SESSION_STORAGE_ORIGIN = "https://cs2.free"
 OPEN_BUTTON_XPATH = "//*[@id='__next']/section/main/div/div[2]/section/section/section/section[2]/div[1]/button"
 LOGIN_PATTERN = re.compile(r"(iniciar sesi[oó]n|log in|login|sign in)", re.IGNORECASE)
+AUTHENTICATED_PATTERN = re.compile(
+    r"(logged in as:|profile|logout|change password|view profile)",
+    re.IGNORECASE,
+)
+OPEN_READY_PATTERN = re.compile(r"\bopen\b", re.IGNORECASE)
+COOLDOWN_PATTERN = re.compile(r"\b\d{1,2}\s*:\s*\d{2}\s*:\s*\d{2}\b")
 REQUIREMENT_LABELS = [
     "Login",
     "Join Discord Server",
@@ -70,7 +77,11 @@ class CS2FreeSite:
     page: Page | None = field(default=None, init=False)
     playwright: Playwright | None = field(default=None, init=False)
     diagnostics_dir: Path = field(init=False)
-    loaded_session_had_auth: bool = field(default=False, init=False)
+    loaded_storage_state: dict[str, Any] | None = field(default=None, init=False)
+    loaded_session_storage: dict[str, dict[str, str]] = field(
+        default_factory=dict,
+        init=False,
+    )
 
     def __post_init__(self) -> None:
         self.diagnostics_dir = self.workspace_dir / "cs2free_daily"
@@ -118,6 +129,26 @@ class CS2FreeSite:
                             "CS2.free listo para continuar. Requisitos detectados: %s",
                             requirement_statuses,
                         )
+                        button_text, button_enabled = self.inspect_open_button_state()
+                        if button_text and (
+                            self.is_open_button_cooldown(button_text, button_enabled)
+                        ):
+                            self.capture_diagnostics(
+                                status="cooldown",
+                                requirement_statuses=requirement_statuses,
+                                reward_text=None,
+                                reward_kind="unknown",
+                                reward_candidates=[],
+                                visible_buttons_before_sell=[],
+                                visible_buttons_after_sell=[],
+                                sell_button_text=None,
+                                sell_clicked=False,
+                            )
+                            self.logger.info(
+                                "CS2.free muestra la caja en cooldown/no disponible. Texto detectado: %s",
+                                button_text,
+                            )
+                            return "cooldown"
                         self.click_open_button()
                         post_open_status = self.handle_post_open_state(requirement_statuses)
                         self.logger.info(
@@ -132,7 +163,7 @@ class CS2FreeSite:
                             "Error controlado en CS2.free. El navegador seguira abierto."
                         )
                         if self.context is not None:
-                            save_session(self.context, self.session_file, self.logger)
+                            self.save_cs2free_session()
                         if not self.prompt_retry():
                             return "aborted"
             finally:
@@ -140,8 +171,9 @@ class CS2FreeSite:
                 self.playwright = None
 
     def _open_browser(self, playwright: Playwright) -> None:
-        session_data = load_session(self.session_file, self.logger)
-        self.loaded_session_had_auth = self.session_has_auth_state(session_data)
+        session_payload = self.load_cs2free_session()
+        self.loaded_storage_state = session_payload["storage_state"]
+        self.loaded_session_storage = session_payload["session_storage"]
 
         self.browser = playwright.chromium.launch(
             headless=self.headless,
@@ -167,12 +199,8 @@ class CS2FreeSite:
             },
         }
 
-        if self.loaded_session_had_auth:
-            context_kwargs["storage_state"] = session_data
-        elif session_data:
-            self.logger.info(
-                "La sesion guardada de CS2.free no contiene cookies ni estado util. Se ignora y se tratara como no autenticada."
-            )
+        if self.loaded_storage_state:
+            context_kwargs["storage_state"] = self.loaded_storage_state
 
         self.context = self.browser.new_context(**context_kwargs)
         self.context.set_default_timeout(15_000)
@@ -186,6 +214,22 @@ class CS2FreeSite:
             });
             """
         )
+        if self.loaded_session_storage:
+            self.context.add_init_script(
+                """
+                (storageByOrigin) => {
+                  const entries = storageByOrigin[window.location.origin];
+                  if (!entries) return;
+                  for (const [key, value] of Object.entries(entries)) {
+                    try {
+                      window.sessionStorage.setItem(key, value);
+                    } catch (error) {
+                    }
+                  }
+                }
+                """,
+                self.loaded_session_storage,
+            )
 
         self.page = self.context.new_page()
         self.page.bring_to_front()
@@ -236,7 +280,7 @@ class CS2FreeSite:
             self.wait_for_page_ready()
 
             if self.is_logged_in():
-                save_session(self.context, self.session_file, self.logger)
+                self.save_cs2free_session(force=True)
                 self.logger.info("Login manual detectado en CS2.free y sesion guardada.")
                 return
 
@@ -249,11 +293,13 @@ class CS2FreeSite:
     def is_logged_in(self) -> bool:
         assert self.page is not None
 
+        if self.has_authenticated_signals():
+            return True
+
         guest_locators = [
             self.page.get_by_role("button", name=LOGIN_PATTERN).first,
             self.page.get_by_role("link", name=LOGIN_PATTERN).first,
             self.page.locator("a[href*='login']").first,
-            self.page.locator("a[href*='steam']").first,
             self.page.locator("button[data-testid*='login']").first,
         ]
 
@@ -261,6 +307,17 @@ class CS2FreeSite:
             return False
 
         return True
+
+    def has_authenticated_signals(self) -> bool:
+        assert self.page is not None
+
+        try:
+            body_text = self.page.locator("body").inner_text(timeout=5_000)
+        except Exception:
+            return False
+
+        compact = self.compact_text(body_text)
+        return bool(AUTHENTICATED_PATTERN.search(compact))
 
     def page_contains_requirement_panel(self) -> bool:
         assert self.page is not None
@@ -273,13 +330,95 @@ class CS2FreeSite:
         compact = self.compact_text(body_text)
         return all(label in compact for label in REQUIREMENT_LABELS)
 
-    def session_has_auth_state(self, session_data: dict[str, Any] | None) -> bool:
+    def load_cs2free_session(self) -> dict[str, Any]:
+        session_data = load_session(self.session_file, self.logger)
         if not session_data:
+            return {
+                "storage_state": None,
+                "session_storage": {},
+            }
+
+        if "storage_state" in session_data or "session_storage" in session_data:
+            return {
+                "storage_state": session_data.get("storage_state"),
+                "session_storage": session_data.get("session_storage") or {},
+            }
+
+        return {
+            "storage_state": session_data,
+            "session_storage": {},
+        }
+
+    def read_session_storage_entries(self) -> dict[str, str]:
+        assert self.page is not None
+
+        try:
+            storage_entries = self.page.evaluate(
+                """
+                () => {
+                  const entries = {};
+                  for (let i = 0; i < window.sessionStorage.length; i++) {
+                    const key = window.sessionStorage.key(i);
+                    entries[key] = window.sessionStorage.getItem(key);
+                  }
+                  return entries;
+                }
+                """
+            )
+        except Exception:
+            return {}
+
+        if not isinstance(storage_entries, dict):
+            return {}
+        return {str(key): str(value) for key, value in storage_entries.items()}
+
+    def save_cs2free_session(self, force: bool = False) -> bool:
+        assert self.context is not None
+
+        authenticated_now = False
+        if self.page is not None:
+            try:
+                authenticated_now = self.has_authenticated_signals()
+            except Exception:
+                authenticated_now = False
+
+        if not force and not authenticated_now:
+            self.logger.info(
+                "No se sobreescribe la sesion de CS2.free porque el estado actual no parece autenticado."
+            )
             return False
 
-        cookies = session_data.get("cookies")
-        origins = session_data.get("origins")
-        return bool(cookies or origins)
+        try:
+            storage_state = self.context.storage_state(indexed_db=True)
+        except Exception:
+            self.logger.exception("No se pudo leer el storage_state de CS2.free.")
+            return False
+
+        session_storage_entries = {}
+        if self.page is not None:
+            session_storage_entries = self.read_session_storage_entries()
+
+        payload = {
+            "storage_state": storage_state,
+            "session_storage": (
+                {SESSION_STORAGE_ORIGIN: session_storage_entries}
+                if session_storage_entries
+                else {}
+            ),
+        }
+
+        try:
+            self.session_file.parent.mkdir(parents=True, exist_ok=True)
+            self.session_file.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            self.logger.exception("No se pudo guardar la sesion extendida de CS2.free.")
+            return False
+
+        self.logger.info("Sesion guardada en %s.", self.session_file)
+        return True
 
     def inspect_account_requirements(self) -> dict[str, str]:
         assert self.page is not None
@@ -344,6 +483,45 @@ class CS2FreeSite:
 
         button = self.page.locator(f"xpath={OPEN_BUTTON_XPATH}")
         self.safe_click(button, "boton Open de CS2.free")
+
+    def inspect_open_button_state(self) -> tuple[str | None, bool]:
+        assert self.page is not None
+
+        button = self.page.locator(f"xpath={OPEN_BUTTON_XPATH}")
+        try:
+            button.wait_for(state="visible", timeout=12_000)
+        except PlaywrightTimeoutError:
+            self.logger.warning("No se encontro el boton Open de CS2.free.")
+            return None, False
+
+        try:
+            button_text = self.compact_text(button.inner_text(timeout=3_000))
+        except Exception:
+            button_text = ""
+
+        try:
+            button_enabled = button.is_enabled(timeout=3_000)
+        except Exception:
+            button_enabled = False
+
+        self.logger.info(
+            "Boton principal de CS2.free detectado con texto: %s | Habilitado: %s",
+            button_text or "sin texto",
+            button_enabled,
+        )
+        return button_text or None, button_enabled
+
+    def is_open_button_cooldown(
+        self,
+        button_text: str,
+        button_enabled: bool,
+    ) -> bool:
+        compact = self.compact_text(button_text)
+        if COOLDOWN_PATTERN.search(compact):
+            return True
+        if not button_enabled and not OPEN_READY_PATTERN.search(compact):
+            return True
+        return False
 
     def handle_post_open_state(self, requirement_statuses: dict[str, str]) -> str:
         assert self.page is not None
@@ -708,7 +886,7 @@ class CS2FreeSite:
 
             if not page_closed:
                 try:
-                    save_session(self.context, self.session_file, self.logger)
+                    self.save_cs2free_session()
                 except Exception:
                     self.logger.exception(
                         "Fallo al guardar la sesion de CS2.free durante el cierre."
