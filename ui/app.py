@@ -466,25 +466,49 @@ class DashboardWindow(QMainWindow):
         self.presence_status_label = QLabel("No iniciado")
         self.presence_status_label.setAlignment(Qt.AlignCenter)
         self.presence_status_label.setStyleSheet(
-            self._steam_badge_style("#e9e9e9", "#111111")
+            self._presence_status_style("#e9e9e9", "#111111")
         )
         self.presence_detail_label = QLabel("-")
         self.presence_detail_label.setWordWrap(True)
+        self.presence_detail_label.setStyleSheet("color: #333333; font-size: 11px;")
         self.presence_script_label = QLabel("Script: -")
+        self.presence_script_label.setStyleSheet("color: #333333; font-size: 11px;")
         self.presence_token_label = QLabel("Refresh token: -")
+        self.presence_token_label.setStyleSheet("color: #333333; font-size: 11px;")
         presence_buttons_layout = QHBoxLayout()
-        self.presence_start_button = QPushButton("Iniciar")
-        self.presence_stop_button = QPushButton("Parar")
-        self.presence_restart_button = QPushButton("Reiniciar")
+        self.presence_start_button = QToolButton()
+        self.presence_start_button.setToolTip("Iniciar presencia en Steam")
+        self.presence_start_button.setAutoRaise(True)
+        self.presence_start_button.setIcon(
+            self.style().standardIcon(self.style().StandardPixmap.SP_MediaPlay)
+        )
+        self.presence_start_button.setStyleSheet(self._presence_button_style("#b7e4c7"))
+        self.presence_stop_button = QToolButton()
+        self.presence_stop_button.setToolTip("Parar presencia en Steam")
+        self.presence_stop_button.setAutoRaise(True)
+        self.presence_stop_button.setIcon(
+            self.style().standardIcon(self.style().StandardPixmap.SP_MediaStop)
+        )
+        self.presence_stop_button.setStyleSheet(self._presence_button_style("#f5c2c7"))
+        self.presence_restart_button = QToolButton()
+        self.presence_restart_button.setToolTip("Reiniciar presencia en Steam")
+        self.presence_restart_button.setAutoRaise(True)
+        self.presence_restart_button.setIcon(
+            self.style().standardIcon(self.style().StandardPixmap.SP_BrowserReload)
+        )
+        self.presence_restart_button.setStyleSheet(self._presence_button_style("#cfe8ff"))
         presence_buttons_layout.addWidget(self.presence_start_button)
         presence_buttons_layout.addWidget(self.presence_stop_button)
         presence_buttons_layout.addWidget(self.presence_restart_button)
+        presence_buttons_layout.addStretch(1)
         presence_layout.addWidget(self.presence_status_label)
         presence_layout.addWidget(self.presence_detail_label)
         presence_layout.addWidget(self.presence_script_label)
         presence_layout.addWidget(self.presence_token_label)
         presence_layout.addLayout(presence_buttons_layout)
         presence_layout.addStretch(1)
+        presence_group.setMaximumWidth(220)
+        presence_group.setMinimumWidth(200)
         header_layout.addWidget(presence_group, stretch=1)
 
         actions_layout = QHBoxLayout()
@@ -729,6 +753,29 @@ class DashboardWindow(QMainWindow):
         return (
             f"background-color: {background}; color: {foreground}; "
             "border-radius: 8px; padding: 4px 10px; font-size: 11px; font-weight: bold;"
+        )
+
+    def _presence_status_style(self, background: str, foreground: str) -> str:
+        return (
+            f"background-color: {background}; color: {foreground}; "
+            "border-radius: 6px; padding: 3px 8px; font-size: 10px; font-weight: bold;"
+        )
+
+    def _presence_button_style(self, background: str) -> str:
+        return (
+            "QToolButton {"
+            f"background-color: {background};"
+            "border: 1px solid #bdbdbd;"
+            "border-radius: 6px;"
+            "padding: 3px;"
+            "}"
+            "QToolButton:hover {"
+            "border-color: #7f7f7f;"
+            "}"
+            "QToolButton:disabled {"
+            "background-color: #efefef;"
+            "border-color: #d0d0d0;"
+            "}"
         )
 
     def start_run(self) -> None:
@@ -1322,7 +1369,7 @@ class DashboardWindow(QMainWindow):
 
         self.presence_status_label.setText(status_text)
         self.presence_status_label.setStyleSheet(
-            self._steam_badge_style(
+            self._presence_status_style(
                 self.presence_status_background(status_text, ready),
                 "#111111",
             )
