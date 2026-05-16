@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import logging
+import re
 import shutil
 import threading
 import unicodedata
@@ -17,11 +18,13 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
+    QLineEdit,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -2369,16 +2372,63 @@ class DashboardWindow(QMainWindow):
             button.setEnabled(enabled)
 
     def show_prompt_dialog(self, request: PromptRequest) -> None:
-        text, accepted = QInputDialog.getText(
-            self,
-            request.title,
-            request.message,
-            text=request.default,
+        dialog = QDialog(self)
+        dialog.setWindowTitle(request.title)
+        dialog.setModal(True)
+        dialog.resize(620, 220)
+
+        layout = QVBoxLayout(dialog)
+
+        message_label = QLabel(self._prompt_message_to_rich_text(request.message))
+        message_label.setWordWrap(True)
+        message_label.setTextFormat(Qt.TextFormat.RichText)
+        message_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
         )
-        if not accepted:
+        message_label.setOpenExternalLinks(True)
+        layout.addWidget(message_label)
+
+        input_field = QLineEdit()
+        input_field.setText(request.default)
+        if request.password:
+            input_field.setEchoMode(QLineEdit.EchoMode.Password)
+        layout.addWidget(input_field)
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        input_field.setFocus()
+        input_field.selectAll()
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             self.prompt_bridge.submit_answer("q")
             return
-        self.prompt_bridge.submit_answer(text)
+        self.prompt_bridge.submit_answer(input_field.text())
+
+    def _prompt_message_to_rich_text(self, message: str) -> str:
+        parts: list[str] = []
+        last_index = 0
+        for match in re.finditer(r"https?://[^\s]+", message):
+            start, end = match.span()
+            url = match.group(0)
+            parts.append(self._html_escape(message[last_index:start]))
+            escaped_url = self._html_escape(url)
+            parts.append(f'<a href="{escaped_url}">{escaped_url}</a>')
+            last_index = end
+        parts.append(self._html_escape(message[last_index:]))
+        return "".join(parts).replace("\n", "<br>")
+
+    def _html_escape(self, value: str) -> str:
+        return (
+            value.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
 
     def load_settings_into_controls(self) -> None:
         enabled_sites = set(self.get_enabled_sites())

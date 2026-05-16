@@ -141,7 +141,9 @@ class CSGOCasesSite:
 
         try:
             answer = ask_text(
-                f"Abre manualmente '{case_label}' fuera del navegador automatizado, resuelve todo y cuando termines pulsa Enter para continuar. "
+                f"Abre manualmente '{case_label}' fuera del navegador automatizado.\n"
+                f"URL: {target_url}\n\n"
+                "Resuelve todo y cuando termines pulsa Enter para continuar. "
                 "Escribe 'q' para cancelar y restaurar el cambio temporal de Steam: ",
                 title=f"Intervencion manual en {case_label}",
             ).strip().lower()
