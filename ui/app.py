@@ -56,6 +56,8 @@ from steam_status import (
     update_steam_refreshing,
 )
 
+EUR_TO_USD_RATE = 1.08
+
 
 class LogEmitter(QObject):
     message = Signal(str)
@@ -1563,7 +1565,10 @@ class DashboardWindow(QMainWindow):
                 self.site_table,
                 row_index,
                 2,
-                str(row.get("balance_text") or "-"),
+                self.format_balance_in_usd(
+                    row.get("balance_text"),
+                    row.get("balance_value"),
+                ),
             )
             self.set_table_item(
                 self.site_table,
@@ -1889,10 +1894,99 @@ class DashboardWindow(QMainWindow):
             latest = site_payload.get("latest")
             if not isinstance(latest, dict):
                 continue
-            value = latest.get("balance_value")
-            if isinstance(value, (int, float)):
-                total += float(value)
+            normalized_value = self.normalize_amount_to_usd(
+                latest.get("balance_value"),
+                latest.get("balance_text"),
+            )
+            if normalized_value is not None:
+                total += normalized_value
         return round(total, 2)
+
+    def calculate_run_total_balance_usd(self, run_row: dict[str, object]) -> float | None:
+        site_rows = list(run_row.get("site_results") or [])
+        total = 0.0
+        found = False
+        for site_row in site_rows:
+            if not isinstance(site_row, dict):
+                continue
+            normalized_value = self.normalize_amount_to_usd(
+                site_row.get("balance_value"),
+                site_row.get("balance_text"),
+            )
+            if normalized_value is None:
+                continue
+            total += normalized_value
+            found = True
+        if not found:
+            return None
+        return round(total, 2)
+
+    def calculate_run_positive_delta_usd(self, run_row: dict[str, object]) -> float | None:
+        site_rows = list(run_row.get("site_results") or [])
+        total = 0.0
+        found = False
+        for site_row in site_rows:
+            if not isinstance(site_row, dict):
+                continue
+            normalized_delta = self.normalize_amount_to_usd(
+                site_row.get("balance_delta"),
+                site_row.get("balance_text"),
+            )
+            if normalized_delta is None or normalized_delta <= 0:
+                continue
+            total += normalized_delta
+            found = True
+        if not found:
+            return None
+        return round(total, 2)
+
+    def format_balance_in_usd(
+        self,
+        balance_text: object,
+        balance_value: object,
+    ) -> str:
+        normalized_value = self.normalize_amount_to_usd(balance_value, balance_text)
+        if normalized_value is not None:
+            return self.format_amount(normalized_value)
+        if isinstance(balance_text, str) and balance_text.strip():
+            parsed_value = self.extract_numeric_amount(balance_text)
+            normalized_from_text = self.normalize_amount_to_usd(parsed_value, balance_text)
+            if normalized_from_text is not None:
+                return self.format_amount(normalized_from_text)
+        return "-"
+
+    def normalize_amount_to_usd(
+        self,
+        value: object,
+        currency_hint: object,
+    ) -> float | None:
+        if value is None:
+            return None
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return None
+        currency = self.detect_currency(currency_hint)
+        if currency == "eur":
+            return round(numeric_value * EUR_TO_USD_RATE, 2)
+        return round(numeric_value, 2)
+
+    def detect_currency(self, value: object) -> str:
+        text = str(value or "").strip().lower()
+        if "€" in text or " eur" in text or text.startswith("eur"):
+            return "eur"
+        if "$" in text or "us$" in text or "usd" in text:
+            return "usd"
+        return "usd"
+
+    def extract_numeric_amount(self, text: str) -> float | None:
+        match = re.search(r"-?\d+(?:[.,]\d+)?", text)
+        if not match:
+            return None
+        try:
+            return float(match.group(0).replace(",", "."))
+        except ValueError:
+            return None
 
     def update_steam_panel(self, steam_status: object) -> None:
         if not isinstance(steam_status, dict):
@@ -2201,7 +2295,7 @@ class DashboardWindow(QMainWindow):
                 self.runs_table,
                 row_index,
                 10,
-                self.format_amount(run_row.get("positive_delta")),
+                self.format_amount(self.calculate_run_positive_delta_usd(run_row)),
             )
 
         if self.run_history_rows:
@@ -2238,8 +2332,8 @@ class DashboardWindow(QMainWindow):
             f"Fin: {str(run_row.get('finished_at') or '-')}",
             f"Estado del flujo: {str(run_row.get('run_status') or '-')}",
             f"Horas recientes de CS2: {self.format_recent_hours(run_row.get('recent_hours'))}",
-            f"Saldo total detectado: {self.format_amount(run_row.get('total_balance_value'))}",
-            f"Delta positivo del run: {self.format_amount(run_row.get('positive_delta'))}",
+            f"Saldo total detectado: {self.format_amount(self.calculate_run_total_balance_usd(run_row))}",
+            f"Delta positivo del run: {self.format_amount(self.calculate_run_positive_delta_usd(run_row))}",
             "",
             "Sitios:",
         ]
@@ -2256,8 +2350,8 @@ class DashboardWindow(QMainWindow):
                 [
                     f"{str(site_row.get('site_name') or '-')}: {str(site_row.get('status') or '-')}",
                     f"  Recompensa: {reward_text}",
-                    f"  Saldo: {str(site_row.get('balance_text') or '-')}",
-                    f"  Delta: {self.format_amount(site_row.get('balance_delta'))}",
+                    f"  Saldo: {self.format_balance_in_usd(site_row.get('balance_text'), site_row.get('balance_value'))}",
+                    f"  Delta: {self.format_amount(self.normalize_amount_to_usd(site_row.get('balance_delta'), site_row.get('balance_text')))}",
                 ]
             )
 
