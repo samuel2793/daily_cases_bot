@@ -25,6 +25,7 @@ class RuntimePaths:
     bloodycase_session_file: Path
     cs2free_session_file: Path
     g4skins_session_file: Path
+    dropland_session_file: Path
     keydrop_steam_avatar_file: Path
     csgocases_steam_avatar_file: Path
     bloodycase_steam_avatar_file: Path
@@ -54,6 +55,7 @@ class RuntimePaths:
             bloodycase_session_file=sessions_dir / "bloodycase_session.json",
             cs2free_session_file=sessions_dir / "cs2free_session.json",
             g4skins_session_file=sessions_dir / "g4skins_session.json",
+            dropland_session_file=sessions_dir / "dropland_session.json",
             keydrop_steam_avatar_file=images_dir / "keydrop.webp",
             csgocases_steam_avatar_file=images_dir / "csgocases.png",
             bloodycase_steam_avatar_file=images_dir / "bloodycase.png",

@@ -391,12 +391,14 @@ class DashboardWindow(QMainWindow):
         self.prepare_bloodycase_button = QPushButton("Preparar BloodyCase")
         self.prepare_cs2free_button = QPushButton("Preparar CS2.free")
         self.prepare_g4skins_button = QPushButton("Preparar G4Skins")
+        self.prepare_dropland_button = QPushButton("Preparar Dropland")
         prepare_buttons_layout.addWidget(self.prepare_steam_button)
         prepare_buttons_layout.addWidget(self.prepare_keydrop_button)
         prepare_buttons_layout.addWidget(self.prepare_csgocases_button)
         prepare_buttons_layout.addWidget(self.prepare_bloodycase_button)
         prepare_buttons_layout.addWidget(self.prepare_cs2free_button)
         prepare_buttons_layout.addWidget(self.prepare_g4skins_button)
+        prepare_buttons_layout.addWidget(self.prepare_dropland_button)
         prepare_buttons_layout.addStretch(1)
 
         self.setup_table = QTableWidget(0, 4)
@@ -660,7 +662,7 @@ class DashboardWindow(QMainWindow):
         self.history_tab = QWidget()
         history_layout = QVBoxLayout(self.history_tab)
 
-        self.runs_table = QTableWidget(0, 10)
+        self.runs_table = QTableWidget(0, 11)
         self.runs_table.setHorizontalHeaderLabels(
             [
                 "Fecha",
@@ -672,6 +674,7 @@ class DashboardWindow(QMainWindow):
                 "BloodyCase",
                 "CS2.free",
                 "G4Skins",
+                "Dropland",
                 "Delta",
             ]
         )
@@ -770,11 +773,13 @@ class DashboardWindow(QMainWindow):
         self.enable_bloodycase_checkbox = QCheckBox("Ejecutar BloodyCase")
         self.enable_cs2free_checkbox = QCheckBox("Ejecutar CS2.free")
         self.enable_g4skins_checkbox = QCheckBox("Ejecutar G4Skins")
+        self.enable_dropland_checkbox = QCheckBox("Ejecutar Dropland")
         flow_layout.addWidget(self.enable_keydrop_checkbox)
         flow_layout.addWidget(self.enable_csgocases_checkbox)
         flow_layout.addWidget(self.enable_bloodycase_checkbox)
         flow_layout.addWidget(self.enable_cs2free_checkbox)
         flow_layout.addWidget(self.enable_g4skins_checkbox)
+        flow_layout.addWidget(self.enable_dropland_checkbox)
         flow_layout.addStretch(1)
 
         steam_group_settings = QGroupBox("Steam")
@@ -853,6 +858,7 @@ class DashboardWindow(QMainWindow):
         self.prepare_bloodycase_button.clicked.connect(lambda: self.start_preparation("bloodycase"))
         self.prepare_cs2free_button.clicked.connect(lambda: self.start_preparation("cs2free"))
         self.prepare_g4skins_button.clicked.connect(lambda: self.start_preparation("g4skins"))
+        self.prepare_dropland_button.clicked.connect(lambda: self.start_preparation("dropland"))
         self.revalidate_session_button.clicked.connect(self.revalidate_selected_session)
         self.delete_session_button.clicked.connect(self.delete_selected_session)
         self.session_table.itemSelectionChanged.connect(
@@ -1459,6 +1465,7 @@ class DashboardWindow(QMainWindow):
             ("bloodycase", "BloodyCase", self.paths.bloodycase_session_file),
             ("cs2free", "CS2.free", self.paths.cs2free_session_file),
             ("g4skins", "G4Skins", self.paths.g4skins_session_file),
+            ("dropland", "Dropland", self.paths.dropland_session_file),
         ]
 
     def get_selected_session_row(self) -> dict[str, str] | None:
@@ -1691,6 +1698,11 @@ class DashboardWindow(QMainWindow):
             if bloodycase_delta is not None:
                 return bloodycase_delta
 
+        if site_name == "dropland":
+            dropland_delta = self.parse_dropland_cooldown_delta(text)
+            if dropland_delta is not None:
+                return dropland_delta
+
         generic_hms_deltas = self.extract_hms_deltas(text)
         if generic_hms_deltas:
             return min(generic_hms_deltas)
@@ -1758,6 +1770,27 @@ class DashboardWindow(QMainWindow):
 
         if deltas:
             return min(deltas)
+        return None
+
+    def parse_dropland_cooldown_delta(self, text: str) -> timedelta | None:
+        line_tokens = [line.strip() for line in text.splitlines() if line.strip()]
+        for start_index in range(len(line_tokens)):
+            fragments: list[str] = []
+            for token in line_tokens[start_index : start_index + 8]:
+                if not re.fullmatch(r"\d{1,2}|:", token):
+                    break
+                fragments.append(token)
+                candidate = "".join(fragments)
+                if not re.fullmatch(r"\d{1,2}:\d{2}:\d{2}", candidate):
+                    if len(candidate) > 8:
+                        break
+                    continue
+                hours_text, minutes_text, seconds_text = candidate.split(":")
+                return timedelta(
+                    hours=int(hours_text),
+                    minutes=int(minutes_text),
+                    seconds=int(seconds_text),
+                )
         return None
 
     def parse_timestamp(self, value: str) -> datetime | None:
@@ -2140,6 +2173,12 @@ class DashboardWindow(QMainWindow):
                 self.runs_table,
                 row_index,
                 9,
+                site_status_map.get("dropland", "-"),
+            )
+            self.set_table_item(
+                self.runs_table,
+                row_index,
+                10,
                 self.format_amount(run_row.get("positive_delta")),
             )
 
@@ -2273,6 +2312,7 @@ class DashboardWindow(QMainWindow):
                 self.make_session_check("BloodyCase", self.paths.bloodycase_session_file),
                 self.make_session_check("CS2.free", self.paths.cs2free_session_file),
                 self.make_session_check("G4Skins", self.paths.g4skins_session_file),
+                self.make_session_check("Dropland", self.paths.dropland_session_file),
             ]
         )
 
@@ -2569,6 +2609,7 @@ class DashboardWindow(QMainWindow):
             self.prepare_bloodycase_button,
             self.prepare_cs2free_button,
             self.prepare_g4skins_button,
+            self.prepare_dropland_button,
             self.refresh_setup_button,
         ):
             button.setEnabled(enabled)
@@ -2647,6 +2688,7 @@ class DashboardWindow(QMainWindow):
         self.enable_bloodycase_checkbox.setChecked("bloodycase" in enabled_sites)
         self.enable_cs2free_checkbox.setChecked("cs2free" in enabled_sites)
         self.enable_g4skins_checkbox.setChecked("g4skins" in enabled_sites)
+        self.enable_dropland_checkbox.setChecked("dropland" in enabled_sites)
 
         self.use_presence_checkbox.setChecked(
             self.get_steam_bool("use_presence_during_run")
@@ -2686,6 +2728,7 @@ class DashboardWindow(QMainWindow):
                 ("bloodycase", self.enable_bloodycase_checkbox),
                 ("cs2free", self.enable_cs2free_checkbox),
                 ("g4skins", self.enable_g4skins_checkbox),
+                ("dropland", self.enable_dropland_checkbox),
             )
             if checkbox.isChecked()
         ]
