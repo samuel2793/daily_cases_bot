@@ -64,6 +64,8 @@ GENERIC_UI_TEXT_PATTERN = re.compile(
     r"here's a list of the items you can win spinning this case)",
     re.IGNORECASE,
 )
+POST_OPEN_MAX_ATTEMPTS = 14
+POST_OPEN_REWARD_STABLE_ATTEMPTS = 2
 
 
 @dataclass(slots=True)
@@ -531,15 +533,68 @@ class CS2FreeSite:
         assert self.page is not None
 
         self.logger.info(
-            "Esperando el estado posterior a la apertura de la caja de CS2.free."
+            "Esperando el estado posterior a la apertura de la caja de CS2.free. "
+            "Se registraran los cambios intermedios hasta confirmar recompensa y opciones de venta."
         )
-        self.human_delay(10.0, 13.0)
+        observations: list[dict[str, Any]] = []
+        reward_candidates: list[dict[str, Any]] = []
+        reward_text: str | None = None
+        reward_kind = "unknown"
+        visible_buttons_before_sell: list[str] = []
+        sell_button_text: str | None = None
+        reward_stable_hits = 0
+        last_signature: tuple[str | None, str, str | None] | None = None
+        body_text = ""
 
-        body_text = self.page.locator("body").inner_text(timeout=10_000)
-        reward_candidates = self.collect_visible_text_candidates()
-        reward_text = self.infer_reward_text(reward_candidates, body_text)
-        reward_kind = self.infer_reward_kind(reward_text)
-        visible_buttons_before_sell = self.collect_visible_button_texts()
+        for attempt in range(1, POST_OPEN_MAX_ATTEMPTS + 1):
+            if attempt == 1:
+                self.human_delay(4.0, 5.5)
+            else:
+                self.human_delay(2.0, 3.5)
+
+            body_text = self.page.locator("body").inner_text(timeout=10_000)
+            reward_candidates = self.collect_visible_text_candidates()
+            reward_text = self.infer_reward_text(reward_candidates, body_text)
+            reward_kind = self.infer_reward_kind(reward_text)
+            visible_buttons_before_sell = self.collect_visible_button_texts()
+            sell_button_text = self.find_sell_button_text()
+            observation = {
+                "attempt": attempt,
+                "captured_at": datetime.now().astimezone().isoformat(),
+                "reward_text": reward_text,
+                "reward_kind": reward_kind,
+                "sell_button_text": sell_button_text,
+                "visible_buttons": visible_buttons_before_sell,
+            }
+            observations.append(observation)
+
+            signature = (reward_text, reward_kind, sell_button_text)
+            if signature != last_signature:
+                self.logger.info(
+                    "Estado postapertura de CS2.free (%s/%s) | Recompensa: %s | Tipo: %s | Vender: %s",
+                    attempt,
+                    POST_OPEN_MAX_ATTEMPTS,
+                    reward_text or "sin detectar",
+                    reward_kind,
+                    sell_button_text or "no",
+                )
+                last_signature = signature
+
+            if reward_text:
+                reward_stable_hits += 1
+            else:
+                reward_stable_hits = 0
+
+            if reward_kind == "skin" and sell_button_text and reward_stable_hits >= POST_OPEN_REWARD_STABLE_ATTEMPTS:
+                break
+            if reward_kind == "none" and reward_stable_hits >= POST_OPEN_REWARD_STABLE_ATTEMPTS:
+                break
+            if reward_text and reward_kind == "unknown" and reward_stable_hits >= POST_OPEN_REWARD_STABLE_ATTEMPTS:
+                break
+            if sell_button_text and reward_kind != "skin":
+                self.logger.info(
+                    "CS2.free ya muestra un boton de venta, pero la recompensa aun no es una skin clara. Se sigue esperando."
+                )
 
         if reward_text:
             self.logger.info(
@@ -562,7 +617,6 @@ class CS2FreeSite:
                 "No se detectaron botones visibles tras abrir la caja de CS2.free."
             )
 
-        sell_button_text = self.find_sell_button_text()
         sell_clicked = False
         visible_buttons_after_sell = visible_buttons_before_sell
 
@@ -581,7 +635,12 @@ class CS2FreeSite:
                 reward_kind,
             )
 
-        status = "opened_sold" if sell_clicked else "opened_unsold"
+        if not reward_text:
+            status = "opened_unresolved"
+        elif reward_kind == "none":
+            status = "opened_none"
+        else:
+            status = "opened_sold" if sell_clicked else "opened_unsold"
         self.capture_diagnostics(
             status=status,
             requirement_statuses=requirement_statuses,
@@ -592,6 +651,7 @@ class CS2FreeSite:
             visible_buttons_after_sell=visible_buttons_after_sell,
             sell_button_text=sell_button_text,
             sell_clicked=sell_clicked,
+            observations=observations,
         )
         return status
 
@@ -607,6 +667,7 @@ class CS2FreeSite:
         visible_buttons_after_sell: list[str],
         sell_button_text: str | None,
         sell_clicked: bool,
+        observations: list[dict[str, Any]] | None = None,
     ) -> None:
         assert self.page is not None
 
@@ -632,6 +693,7 @@ class CS2FreeSite:
                 "visible_buttons_after_sell": visible_buttons_after_sell,
                 "sell_button_text": sell_button_text,
                 "sell_clicked": sell_clicked,
+                "observations": observations or [],
             }
             json_file.write_text(
                 json.dumps(snapshot, indent=2, ensure_ascii=False),
