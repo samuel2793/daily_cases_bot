@@ -1279,10 +1279,24 @@ class DashboardWindow(QMainWindow):
         last_run = self.history_store.get_last_run_finished_at()
         self.last_run_label.setText(last_run or "Sin ejecuciones registradas")
 
-        self.latest_site_rows = {
+        latest_rows = {
             row["site_name"]: row
             for row in self.history_store.get_latest_site_results()
         }
+        latest_non_disabled_rows = {
+            row["site_name"]: row
+            for row in self.history_store.get_latest_site_results(exclude_disabled=True)
+        }
+        self.latest_site_rows = {}
+        for site_name in SITE_ORDER:
+            latest_row = latest_rows.get(site_name, {})
+            if (
+                str(latest_row.get("status") or "").strip().lower() == "disabled"
+                and site_name in latest_non_disabled_rows
+            ):
+                self.latest_site_rows[site_name] = latest_non_disabled_rows[site_name]
+            elif latest_row:
+                self.latest_site_rows[site_name] = latest_row
         self.refresh_site_table(self.latest_site_rows)
 
         daily_rows = self.history_store.get_daily_totals(
@@ -1569,7 +1583,7 @@ class DashboardWindow(QMainWindow):
                 5,
                 self.format_amount(row.get("balance_delta")),
             )
-            self.apply_site_status_color(row_index, progress)
+            self.apply_site_status_color(row_index, row, progress)
 
     def refresh_live_site_cooldowns(self) -> None:
         if not self.latest_site_rows:
@@ -1590,6 +1604,8 @@ class DashboardWindow(QMainWindow):
             if phase == "Pendiente":
                 return "Pendiente"
             if phase == "Hecho" and result and result != "-":
+                if result == "disabled" and self.should_show_historical_cooldown(row):
+                    return self.format_cooldown_status_text(site_name, row)
                 if result == "cooldown":
                     return self.format_cooldown_status_text(site_name, row)
                 return result
@@ -1817,6 +1833,7 @@ class DashboardWindow(QMainWindow):
     def apply_site_status_color(
         self,
         row_index: int,
+        row: dict[str, object],
         progress: dict[str, str],
     ) -> None:
         status_item = self.site_table.item(row_index, 1)
@@ -1841,6 +1858,8 @@ class DashboardWindow(QMainWindow):
             result = str(progress.get("result") or "").strip().lower()
             if result == "cooldown":
                 status_item.setBackground(QColor("#d9d9d9"))
+            elif result == "disabled" and self.should_show_historical_cooldown(row):
+                status_item.setBackground(QColor("#d9d9d9"))
             elif result == "opened_sold":
                 status_item.setBackground(QColor("#5fd46b"))
             elif result == "aborted":
@@ -1851,6 +1870,9 @@ class DashboardWindow(QMainWindow):
                 status_item.setBackground(QColor("#eeeeee"))
             else:
                 status_item.setBackground(QColor("#a9e5b0"))
+
+    def should_show_historical_cooldown(self, row: dict[str, object]) -> bool:
+        return str(row.get("status") or "").strip().lower() == "cooldown"
 
     def load_total_balance(self) -> float:
         if not self.paths.balances_file.exists():

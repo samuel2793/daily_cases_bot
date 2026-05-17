@@ -163,10 +163,15 @@ class HistoryStore:
             ).fetchall()
         return [{"day": row[0], "total": float(row[1] or 0.0)} for row in rows]
 
-    def get_latest_site_results(self) -> list[dict[str, object]]:
+    def get_latest_site_results(
+        self,
+        *,
+        exclude_disabled: bool = False,
+    ) -> list[dict[str, object]]:
+        where_clause = "WHERE status != 'disabled'" if exclude_disabled else ""
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT
                     sr.site_name,
                     sr.status,
@@ -184,6 +189,7 @@ class HistoryStore:
                 INNER JOIN (
                     SELECT site_name, MAX(id) AS max_id
                     FROM site_results
+                    {where_clause}
                     GROUP BY site_name
                 ) latest
                     ON sr.id = latest.max_id
