@@ -44,6 +44,14 @@ RAFFLE_BUTTON_PATTERN = re.compile(
     r"(participar en sorteos|participar en sorteo|join giveaways|giveaways?)",
     re.IGNORECASE,
 )
+WINNING_MODAL_PATTERN = re.compile(
+    r"(congratulations!\s*your winning|your winning:|tu premio|has ganado)",
+    re.IGNORECASE,
+)
+RAFFLE_REWARD_LABEL_PATTERN = re.compile(
+    r"(participaci[oó]n en sorteos|participar en sorteos|sorteo)",
+    re.IGNORECASE,
+)
 WEAPON_REWARD_PATTERN = re.compile(
     r"\b("
     r"ak-47|m4a1-s|m4a4|awp|usp-s|glock-18|deagle|desert eagle|p250|famas|galil|galil ar|"
@@ -66,6 +74,8 @@ PRE_CLAIM_BODY_PATTERN = re.compile(
     r"gratis cs2 skins|how it works)",
     re.IGNORECASE,
 )
+POST_CLAIM_MAX_ATTEMPTS = 14
+POST_CLAIM_REWARD_STABLE_ATTEMPTS = 2
 
 
 @dataclass(slots=True)
@@ -447,6 +457,7 @@ class BloodyCaseSite:
         sell_offer_value: float | None,
         sell_clicked: bool,
         gain_value: float | None,
+        observations: list[dict[str, Any]] | None = None,
     ) -> None:
         assert self.page is not None
 
@@ -478,6 +489,7 @@ class BloodyCaseSite:
                 "sell_offer_value": sell_offer_value,
                 "sell_clicked": sell_clicked,
                 "gain_value": gain_value,
+                "observations": observations or [],
             }
             json_file.write_text(
                 json.dumps(snapshot, indent=2, ensure_ascii=False),
@@ -501,42 +513,79 @@ class BloodyCaseSite:
         assert self.page is not None
 
         self.logger.info(
-            "Esperando el estado posterior a la apertura de la caja de BloodyCase."
+            "Esperando el estado posterior a la apertura de la caja de BloodyCase. "
+            "Se registraran los cambios intermedios hasta confirmar recompensa y opciones de venta."
         )
+        observations: list[dict[str, Any]] = []
         reward_candidates: list[dict[str, Any]] = []
         reward_text: str | None = None
         reward_kind = "unknown"
         visible_buttons_before_sell: list[str] = []
+        sell_button_text_probe: str | None = None
+        body_text: str | None = None
+        reward_stable_hits = 0
+        last_signature: tuple[str | None, str, str | None] | None = None
 
-        started_at = time.monotonic()
-        self.human_delay(12.0, 15.0)
-        while True:
+        for attempt in range(1, POST_CLAIM_MAX_ATTEMPTS + 1):
+            if attempt == 1:
+                self.human_delay(4.0, 5.5)
+            else:
+                self.human_delay(2.0, 3.5)
             reward_candidates = self.collect_visible_text_candidates()
             visible_buttons_before_sell = self.collect_visible_button_texts()
+            body_text = self.try_read_body_text()
             reward_text = self.infer_reward_text(
                 reward_candidates,
                 visible_buttons_before_sell,
+                body_text=body_text,
             )
             reward_kind = self.infer_reward_kind(
                 reward_text,
                 visible_buttons_before_sell,
-            )
-            body_text = self.try_read_body_text()
-            sell_button_text_probe = self.find_sell_button_text()
-
-            if not self.should_keep_waiting_for_reward(
-                reward_text=reward_text,
-                reward_kind=reward_kind,
                 body_text=body_text,
-                sell_button_text=sell_button_text_probe,
-                elapsed_seconds=time.monotonic() - started_at,
-            ):
-                break
-
-            self.logger.info(
-                "BloodyCase sigue mostrando una vista previa/no concluyente tras el CLAIM. Se espera un poco mas antes de registrar la salida."
             )
-            self.human_delay(3.0, 4.5)
+            sell_button_text_probe = self.find_sell_button_text()
+            observation = {
+                "attempt": attempt,
+                "captured_at": datetime.now().astimezone().isoformat(),
+                "reward_text": reward_text,
+                "reward_kind": reward_kind,
+                "sell_button_text": sell_button_text_probe,
+                "visible_buttons": visible_buttons_before_sell,
+            }
+            observations.append(observation)
+
+            signature = (reward_text, reward_kind, sell_button_text_probe)
+            if signature != last_signature:
+                self.logger.info(
+                    "Estado postapertura de BloodyCase (%s/%s) | Recompensa: %s | Tipo: %s | Vender: %s",
+                    attempt,
+                    POST_CLAIM_MAX_ATTEMPTS,
+                    reward_text or "sin detectar",
+                    reward_kind,
+                    sell_button_text_probe or "no",
+                )
+                last_signature = signature
+
+            if reward_text:
+                reward_stable_hits += 1
+            else:
+                reward_stable_hits = 0
+
+            if reward_kind == "skin" and sell_button_text_probe and reward_stable_hits >= POST_CLAIM_REWARD_STABLE_ATTEMPTS:
+                break
+            if reward_kind == "raffle" and reward_stable_hits >= POST_CLAIM_REWARD_STABLE_ATTEMPTS:
+                break
+            if reward_text and reward_kind == "unknown" and reward_stable_hits >= POST_CLAIM_REWARD_STABLE_ATTEMPTS:
+                break
+            if sell_button_text_probe and reward_kind != "skin":
+                self.logger.info(
+                    "BloodyCase ya muestra boton de venta, pero la recompensa aun no es una skin clara. Se sigue esperando."
+                )
+            elif body_text and PRE_CLAIM_BODY_PATTERN.search(body_text):
+                self.logger.info(
+                    "BloodyCase sigue mostrando una vista previa/no concluyente tras el CLAIM. Se espera un poco mas antes de registrar la salida."
+                )
 
         if reward_text:
             self.logger.info(
@@ -597,7 +646,10 @@ class BloodyCaseSite:
                 reward_kind,
             )
 
-        status = "claim_sold" if sell_clicked else "claim_unsold"
+        if not reward_text:
+            status = "claim_unresolved"
+        else:
+            status = "claim_sold" if sell_clicked else "claim_unsold"
         self.capture_post_claim_diagnostics(
             balance_text_before=balance_text_before,
             balance_value_before=balance_value_before,
@@ -614,30 +666,9 @@ class BloodyCaseSite:
             sell_offer_value=sell_offer_value,
             sell_clicked=sell_clicked,
             gain_value=gain_value,
+            observations=observations,
         )
         return status
-
-    def should_keep_waiting_for_reward(
-        self,
-        *,
-        reward_text: str | None,
-        reward_kind: str,
-        body_text: str | None,
-        sell_button_text: str | None,
-        elapsed_seconds: float,
-    ) -> bool:
-        if elapsed_seconds >= 30:
-            return False
-
-        if reward_kind == "skin":
-            return False
-        if sell_button_text:
-            return False
-        if reward_text and not self.is_generic_reward_text(reward_text):
-            return False
-        if body_text and PRE_CLAIM_BODY_PATTERN.search(body_text):
-            return True
-        return elapsed_seconds < 18
 
     def try_read_body_text(self) -> str | None:
         assert self.page is not None
@@ -850,8 +881,13 @@ class BloodyCaseSite:
         self,
         candidates: list[dict[str, Any]],
         visible_buttons: list[str] | None = None,
+        body_text: str | None = None,
     ) -> str | None:
-        raffle_reward = self.infer_raffle_reward_text(candidates, visible_buttons or [])
+        raffle_reward = self.infer_raffle_reward_text(
+            candidates,
+            visible_buttons or [],
+            body_text=body_text,
+        )
         if raffle_reward:
             return raffle_reward
 
@@ -886,12 +922,17 @@ class BloodyCaseSite:
         self,
         candidates: list[dict[str, Any]],
         visible_buttons: list[str],
+        *,
+        body_text: str | None = None,
     ) -> str | None:
         raffle_button_texts = [
             text for text in visible_buttons if RAFFLE_BUTTON_PATTERN.search(text)
         ]
         if not raffle_button_texts:
             return None
+
+        if body_text and WINNING_MODAL_PATTERN.search(body_text):
+            return "Participacion en sorteos"
 
         raffle_button = raffle_button_texts[0]
         button_candidates = [
@@ -968,9 +1009,14 @@ class BloodyCaseSite:
         self,
         reward_text: str | None,
         visible_buttons: list[str] | None = None,
+        body_text: str | None = None,
     ) -> str:
         if not reward_text:
             return "unknown"
+        if reward_text and RAFFLE_REWARD_LABEL_PATTERN.search(reward_text):
+            return "raffle"
+        if body_text and WINNING_MODAL_PATTERN.search(body_text):
+            return "raffle"
         if visible_buttons and any(
             RAFFLE_BUTTON_PATTERN.search(text) for text in visible_buttons
         ):
