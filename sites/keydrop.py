@@ -213,6 +213,13 @@ class KeyDropSite:
                         self.open_first_daily_case_level()
                         initial_button_text = self.inspect_stable_daily_case_open_button()
                         if initial_button_text and self.is_cooldown_active(initial_button_text):
+                            self.capture_blocked_open_diagnostics(
+                                status="cooldown",
+                                balance_text_before=balance_text,
+                                balance_value_before=balance_value,
+                                initial_button_text=initial_button_text,
+                                restriction_text=None,
+                            )
                             self.logger.info(
                                 "Daily case de KeyDrop en cooldown. Saldo detectado: %s | Estado: %s",
                                 balance_text,

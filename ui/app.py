@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import importlib.util
 import io
 import json
@@ -11,7 +11,7 @@ import threading
 import unicodedata
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -330,9 +330,11 @@ class DashboardWindow(QMainWindow):
             token_detected=self.presence_service._refresh_token_file().exists()
         )
         self.current_run_progress: dict[str, dict[str, str]] = {}
+        self.latest_site_rows: dict[str, dict[str, object]] = {}
         self.run_history_rows: list[dict[str, object]] = []
         self.all_diagnostic_rows: list[dict[str, object]] = []
         self.diagnostic_rows: list[dict[str, object]] = []
+        self.cooldown_end_cache: dict[str, datetime | None] = {}
         self.cancel_requested_in_ui = False
         self.setup_autofocus_done = False
         self.has_non_ok_setup_status = False
@@ -348,6 +350,10 @@ class DashboardWindow(QMainWindow):
         )
         self._build_ui()
         self._wire_signals()
+        self.cooldown_timer = QTimer(self)
+        self.cooldown_timer.setInterval(1_000)
+        self.cooldown_timer.timeout.connect(self.refresh_live_site_cooldowns)
+        self.cooldown_timer.start()
         self.refresh_dashboard()
         self.apply_initial_tab_preference()
 
@@ -1267,11 +1273,11 @@ class DashboardWindow(QMainWindow):
         last_run = self.history_store.get_last_run_finished_at()
         self.last_run_label.setText(last_run or "Sin ejecuciones registradas")
 
-        latest_site_rows = {
+        self.latest_site_rows = {
             row["site_name"]: row
             for row in self.history_store.get_latest_site_results()
         }
-        self.refresh_site_table(latest_site_rows)
+        self.refresh_site_table(self.latest_site_rows)
 
         daily_rows = self.history_store.get_daily_totals(
             self.get_interface_int("daily_totals_limit")
@@ -1528,20 +1534,7 @@ class DashboardWindow(QMainWindow):
             row = latest_site_rows.get(site_name, {})
             progress = self.current_run_progress.get(site_name, {})
 
-            status_text = str(row.get("status", "-"))
-            if progress:
-                phase = str(progress.get("phase") or "Pendiente")
-                result = str(progress.get("result") or "-")
-                if phase == "En curso":
-                    status_text = (
-                        "Cancelando..."
-                        if self.cancel_requested_in_ui
-                        else "En curso"
-                    )
-                elif phase == "Pendiente":
-                    status_text = "Pendiente"
-                elif phase == "Hecho" and result and result != "-":
-                    status_text = result
+            status_text = self.format_site_status_text(site_name, row, progress)
 
             self.set_table_item(self.site_table, row_index, 0, site_name)
             self.set_table_item(self.site_table, row_index, 1, status_text)
@@ -1570,6 +1563,223 @@ class DashboardWindow(QMainWindow):
                 self.format_amount(row.get("balance_delta")),
             )
             self.apply_site_status_color(row_index, progress)
+
+    def refresh_live_site_cooldowns(self) -> None:
+        if not self.latest_site_rows:
+            return
+        self.refresh_site_table(self.latest_site_rows)
+
+    def format_site_status_text(
+        self,
+        site_name: str,
+        row: dict[str, object],
+        progress: dict[str, str],
+    ) -> str:
+        if progress:
+            phase = str(progress.get("phase") or "Pendiente")
+            result = str(progress.get("result") or "-")
+            if phase == "En curso":
+                return "Cancelando..." if self.cancel_requested_in_ui else "En curso"
+            if phase == "Pendiente":
+                return "Pendiente"
+            if phase == "Hecho" and result and result != "-":
+                if result == "cooldown":
+                    return self.format_cooldown_status_text(site_name, row)
+                return result
+
+        status_text = str(row.get("status", "-"))
+        if status_text == "cooldown":
+            return self.format_cooldown_status_text(site_name, row)
+        return status_text
+
+    def format_cooldown_status_text(
+        self,
+        site_name: str,
+        row: dict[str, object],
+    ) -> str:
+        cooldown_end_at = self.resolve_cooldown_end_at(site_name, row)
+        if cooldown_end_at is None:
+            return "cooldown"
+
+        now = datetime.now().astimezone()
+        remaining = cooldown_end_at - now
+        if remaining.total_seconds() <= 0:
+            return "cooldown | 00:00:00"
+        return f"cooldown | {self.format_duration(remaining)}"
+
+    def resolve_cooldown_end_at(
+        self,
+        site_name: str,
+        row: dict[str, object],
+    ) -> datetime | None:
+        diagnostic_path = str(row.get("diagnostic_json_path") or "").strip()
+        created_at = str(row.get("created_at") or "").strip()
+        cache_key = f"{site_name}|{diagnostic_path}|{created_at}"
+        if cache_key in self.cooldown_end_cache:
+            return self.cooldown_end_cache[cache_key]
+
+        captured_at = self.parse_timestamp(
+            created_at
+            or str(row.get("captured_at") or "").strip()
+        )
+        if captured_at is None:
+            self.cooldown_end_cache[cache_key] = None
+            return None
+
+        countdown_delta = self.extract_cooldown_delta(site_name, diagnostic_path)
+        cooldown_end_at = captured_at + countdown_delta if countdown_delta else None
+        self.cooldown_end_cache[cache_key] = cooldown_end_at
+        return cooldown_end_at
+
+    def extract_cooldown_delta(
+        self,
+        site_name: str,
+        diagnostic_path: str,
+    ) -> timedelta | None:
+        if not diagnostic_path:
+            return None
+
+        path = Path(diagnostic_path)
+        payload = self.read_json_file(path)
+        if payload is None:
+            return None
+
+        text_candidates = self.collect_text_candidates_from_payload(payload)
+        text_file = path.with_suffix(".txt")
+        if text_file.exists():
+            try:
+                text_candidates.insert(0, text_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        for candidate in text_candidates:
+            delta = self.parse_cooldown_delta_from_text(site_name, candidate)
+            if delta is not None:
+                return delta
+        return None
+
+    def collect_text_candidates_from_payload(self, payload: object) -> list[str]:
+        values: list[str] = []
+
+        def visit(node: object) -> None:
+            if isinstance(node, str):
+                stripped = node.strip()
+                if stripped:
+                    values.append(stripped)
+                return
+            if isinstance(node, dict):
+                for value in node.values():
+                    visit(value)
+                return
+            if isinstance(node, list):
+                for value in node:
+                    visit(value)
+
+        visit(payload)
+        return values
+
+    def parse_cooldown_delta_from_text(
+        self,
+        site_name: str,
+        text: str,
+    ) -> timedelta | None:
+        if not text:
+            return None
+
+        if site_name == "bloodycase":
+            bloodycase_delta = self.parse_bloodycase_cooldown_delta(text)
+            if bloodycase_delta is not None:
+                return bloodycase_delta
+
+        generic_hms_deltas = self.extract_hms_deltas(text)
+        if generic_hms_deltas:
+            return min(generic_hms_deltas)
+
+        if site_name == "csgocases":
+            hour_match = re.search(
+                r"(?:espera|wait|available in|disponible en)\s*(\d+)\s*h(?:\s*(\d+)\s*min)?",
+                text,
+                re.IGNORECASE,
+            )
+            if hour_match:
+                hours = int(hour_match.group(1))
+                minutes = int(hour_match.group(2) or 0)
+                return timedelta(hours=hours, minutes=minutes)
+
+            minute_match = re.search(
+                r"(?:espera|wait|available in|disponible en)\s*(\d+)\s*min",
+                text,
+                re.IGNORECASE,
+            )
+            if minute_match:
+                return timedelta(minutes=int(minute_match.group(1)))
+
+        return None
+
+    def extract_hms_deltas(self, text: str) -> list[timedelta]:
+        deltas: list[timedelta] = []
+        for hours_text, minutes_text, seconds_text in re.findall(
+            r"\b(\d{1,2})\s*:\s*(\d{2})\s*:\s*(\d{2})\b",
+            text,
+        ):
+            deltas.append(
+                timedelta(
+                    hours=int(hours_text),
+                    minutes=int(minutes_text),
+                    seconds=int(seconds_text),
+                )
+            )
+        return deltas
+
+    def parse_bloodycase_cooldown_delta(self, text: str) -> timedelta | None:
+        deltas: list[timedelta] = []
+
+        for block in re.findall(
+            r"Unlocked\s+from\s+((?:\d+\s+){2,3}\d+)",
+            text,
+            re.IGNORECASE,
+        ):
+            parts = [int(part) for part in re.findall(r"\d+", block)]
+            if len(parts) == 3:
+                hours, minutes, seconds = parts
+                deltas.append(
+                    timedelta(hours=hours, minutes=minutes, seconds=seconds)
+                )
+            elif len(parts) == 4:
+                days, hours, minutes, seconds = parts
+                deltas.append(
+                    timedelta(
+                        days=days,
+                        hours=hours,
+                        minutes=minutes,
+                        seconds=seconds,
+                    )
+                )
+
+        if deltas:
+            return min(deltas)
+        return None
+
+    def parse_timestamp(self, value: str) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+
+    def read_json_file(self, path: Path) -> dict[str, object] | None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def format_duration(self, duration: timedelta) -> str:
+        total_seconds = max(0, int(duration.total_seconds()))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def apply_site_status_color(
         self,

@@ -6,6 +6,7 @@ import random
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from playwright.sync_api import (
@@ -278,10 +279,18 @@ class CSGOCasesSite:
             return "unknown"
 
         if CASE_COOLDOWN_PATTERN.search(body_text):
+            cooldown_excerpt = self.extract_case_cooldown_excerpt(body_text)
+            self.capture_case_availability_diagnostic(
+                case_label=case_label,
+                target_url=target_url,
+                body_text=body_text,
+                cooldown_text=cooldown_excerpt,
+                status="cooldown",
+            )
             self.logger.info(
                 "%s aparece en cooldown en CSGOCases. Texto detectado: %s",
                 case_label,
-                self.extract_case_cooldown_excerpt(body_text),
+                cooldown_excerpt,
             )
             return "cooldown"
 
@@ -445,6 +454,46 @@ class CSGOCasesSite:
         if not match:
             return "sin texto de cooldown"
         return match.group(0)
+
+    def capture_case_availability_diagnostic(
+        self,
+        *,
+        case_label: str,
+        target_url: str,
+        body_text: str,
+        cooldown_text: str,
+        status: str,
+    ) -> None:
+        diagnostics_dir = self.balances_file.parent / "csgocases_daily_free"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        text_file = diagnostics_dir / f"daily_free_{timestamp}.txt"
+        json_file = diagnostics_dir / f"daily_free_{timestamp}.json"
+
+        try:
+            text_file.write_text(body_text, encoding="utf-8")
+            snapshot = {
+                "captured_at": datetime.now().astimezone().isoformat(),
+                "url": target_url,
+                "status": status,
+                "case_label": case_label,
+                "cooldown_text": cooldown_text,
+                "button_text": None,
+            }
+            json_file.write_text(
+                json.dumps(snapshot, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self.logger.info(
+                "Diagnostico de cooldown de CSGOCases guardado en %s y %s.",
+                text_file,
+                json_file,
+            )
+        except Exception:
+            self.logger.exception(
+                "No se pudo capturar el diagnostico de cooldown de CSGOCases."
+            )
 
     def open_balance_check_browser(
         self,

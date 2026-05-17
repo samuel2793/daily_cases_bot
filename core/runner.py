@@ -601,6 +601,7 @@ class DailyCasesRunner:
     ) -> list[SiteExecutionRecord]:
         diagnostics_config = {
             "keydrop": ("keydrop_daily_case", "keydrop_*.json"),
+            "csgocases": ("csgocases_daily_free", "daily_free_*.json"),
             "bloodycase": ("bloodycase_daily_free", "bloodycase_*.json"),
             "cs2free": ("cs2free_daily", "cs2free_*.json"),
             "g4skins": ("g4skins_daily_case", "g4skins_*.json"),
