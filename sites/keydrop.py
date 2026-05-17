@@ -78,6 +78,13 @@ GENERIC_UI_TEXT_PATTERN = re.compile(
     r"check|comprobar|verificar|gratis|free|claim|cooldown)",
     re.IGNORECASE,
 )
+DEPOSIT_LIMIT_PATTERN = re.compile(
+    r"(l[ií]mite a la cantidad de cajas diarias|sin realizar un dep[oó]sito|"
+    r"para abrir m[aá]s cajas diarias|recargues tu cuenta con 10\s*\$)",
+    re.IGNORECASE,
+)
+POST_OPEN_MAX_ATTEMPTS = 18
+POST_OPEN_REWARD_STABLE_ATTEMPTS = 2
 
 
 def load_session(
@@ -214,6 +221,20 @@ class KeyDropSite:
                             return "cooldown"
                         steam_manager = self.prepare_daily_case_avatar_requirement()
                         button_text = self.ensure_daily_case_ready_to_open()
+                        deposit_limit_text = self.detect_deposit_limit_banner_text()
+                        if deposit_limit_text:
+                            self.logger.warning(
+                                "KeyDrop no permite abrir la caja diaria por el limite sin deposito: %s",
+                                deposit_limit_text,
+                            )
+                            self.capture_blocked_open_diagnostics(
+                                status="deposit_required",
+                                balance_text_before=balance_text,
+                                balance_value_before=balance_value,
+                                initial_button_text=button_text,
+                                restriction_text=deposit_limit_text,
+                            )
+                            return "deposit_required"
                         self.click_daily_case_open_button()
                         post_open_status = self.handle_post_open_state(
                             balance_text_before=balance_text,
@@ -689,27 +710,94 @@ class KeyDropSite:
         assert self.page is not None
 
         self.logger.info(
-            "Esperando el estado posterior a la apertura de la daily case de KeyDrop."
+            "Esperando el estado posterior a la apertura de la daily case de KeyDrop. "
+            "Se registraran los cambios intermedios hasta confirmar recompensa y opciones de venta."
         )
-        self.human_delay(7.5, 10.0)
+        observations: list[dict[str, Any]] = []
+        reward_stable_hits = 0
+        last_signature: tuple[str | None, str, str | None] | None = None
+        reward_candidates: list[dict[str, Any]] = []
+        reward_text: str | None = None
+        reward_kind = "unknown"
+        post_open_buttons: list[str] = []
+        sell_button_text: str | None = None
 
-        reward_candidates = self.collect_visible_text_candidates()
-        reward_text = self.infer_reward_text(reward_candidates)
-        reward_kind = self.infer_reward_kind(reward_text)
-        post_open_buttons = self.collect_visible_button_texts()
-        sell_button_text = self.find_sell_button_text()
+        for attempt in range(1, POST_OPEN_MAX_ATTEMPTS + 1):
+            if attempt == 1:
+                self.human_delay(2.5, 3.5)
+            else:
+                self.human_delay(1.0, 1.8)
 
-        if reward_kind != "skin" and sell_button_text:
-            self.logger.info(
-                "KeyDrop aun no muestra una recompensa de skin clara pese a que ya existe un boton de venta. "
-                "Se espera un poco mas y se relee el estado postapertura."
-            )
-            self.human_delay(3.0, 5.0)
+            deposit_limit_text = self.detect_deposit_limit_banner_text()
+            if deposit_limit_text:
+                self.logger.warning(
+                    "KeyDrop ha mostrado el aviso de limite sin deposito tras intentar abrir la caja: %s",
+                    deposit_limit_text,
+                )
+                self.capture_post_open_diagnostics(
+                    status="deposit_required",
+                    balance_text_before=balance_text_before,
+                    balance_value_before=balance_value_before,
+                    balance_text_after=None,
+                    balance_value_after=None,
+                    initial_button_text=initial_button_text,
+                    reward_text=None,
+                    reward_kind="unknown",
+                    reward_candidates=[],
+                    visible_buttons_before_sell=[],
+                    visible_buttons_after_sell=[],
+                    sell_button_text=None,
+                    sell_offer_value=None,
+                    sell_clicked=False,
+                    gain_value=None,
+                    observations=observations,
+                    restriction_text=deposit_limit_text,
+                )
+                return "deposit_required"
+
             reward_candidates = self.collect_visible_text_candidates()
             reward_text = self.infer_reward_text(reward_candidates)
             reward_kind = self.infer_reward_kind(reward_text)
             post_open_buttons = self.collect_visible_button_texts()
             sell_button_text = self.find_sell_button_text()
+            button_text = self.try_read_daily_case_button_text()
+            observation = {
+                "attempt": attempt,
+                "captured_at": datetime.now().astimezone().isoformat(),
+                "button_text": button_text,
+                "reward_text": reward_text,
+                "reward_kind": reward_kind,
+                "sell_button_text": sell_button_text,
+                "visible_buttons": post_open_buttons,
+            }
+            observations.append(observation)
+
+            signature = (reward_text, reward_kind, sell_button_text)
+            if signature != last_signature:
+                self.logger.info(
+                    "Estado postapertura de KeyDrop (%s/%s) | Boton: %s | Recompensa: %s | Tipo: %s | Vender: %s",
+                    attempt,
+                    POST_OPEN_MAX_ATTEMPTS,
+                    button_text or "sin texto",
+                    reward_text or "sin detectar",
+                    reward_kind,
+                    sell_button_text or "no",
+                )
+                last_signature = signature
+
+            if reward_text:
+                reward_stable_hits += 1
+            else:
+                reward_stable_hits = 0
+
+            if reward_kind == "skin" and sell_button_text and reward_stable_hits >= POST_OPEN_REWARD_STABLE_ATTEMPTS:
+                break
+            if reward_kind == "coins" and reward_stable_hits >= POST_OPEN_REWARD_STABLE_ATTEMPTS:
+                break
+            if reward_kind == "unknown" and sell_button_text:
+                self.logger.info(
+                    "KeyDrop ya muestra un boton de venta, pero la recompensa aun no es legible. Se sigue esperando."
+                )
 
         if reward_text:
             self.logger.info(
@@ -770,7 +858,10 @@ class KeyDropSite:
                 reward_kind,
             )
 
-        status = "opened_sold" if sell_clicked else "opened_unsold"
+        if not reward_text:
+            status = "opened_unresolved"
+        else:
+            status = "opened_sold" if sell_clicked else "opened_unsold"
         self.capture_post_open_diagnostics(
             status=status,
             balance_text_before=balance_text_before,
@@ -787,6 +878,7 @@ class KeyDropSite:
             sell_offer_value=sell_offer_value,
             sell_clicked=sell_clicked,
             gain_value=gain_value,
+            observations=observations,
         )
         return status
 
@@ -854,6 +946,28 @@ class KeyDropSite:
         except Exception:
             self.logger.warning("No se pudo releer el saldo de KeyDrop tras la apertura.")
             return None
+
+    def try_read_daily_case_button_text(self) -> str | None:
+        try:
+            return self.inspect_daily_case_open_button()
+        except Exception:
+            return None
+
+    def detect_deposit_limit_banner_text(self) -> str | None:
+        assert self.page is not None
+        try:
+            body_text = self.page.locator("body").inner_text(timeout=3_000)
+        except Exception:
+            return None
+        compact = self.compact_text(body_text)
+        if not compact:
+            return None
+        match = DEPOSIT_LIMIT_PATTERN.search(compact)
+        if not match:
+            return None
+        limit_start = max(0, match.start() - 80)
+        limit_end = min(len(compact), match.end() + 180)
+        return compact[limit_start:limit_end].strip()
 
     def find_sell_button_locator(self) -> Locator | None:
         assert self.page is not None
@@ -1136,11 +1250,13 @@ class KeyDropSite:
             candidate
             for candidate in candidates
             if COINS_PATTERN.search(str(candidate.get("text", "")))
+            and len(str(candidate.get("text", "")).strip()) <= 40
         ]
         amount_candidates = [
             candidate
             for candidate in candidates
             if re.fullmatch(r"\d{1,6}", str(candidate.get("text", "")).strip())
+            and len(str(candidate.get("text", "")).strip()) <= 8
         ]
 
         for coin_candidate in coin_candidates:
@@ -1209,6 +1325,8 @@ class KeyDropSite:
         sell_offer_value: float | None,
         sell_clicked: bool,
         gain_value: float | None,
+        observations: list[dict[str, Any]] | None = None,
+        restriction_text: str | None = None,
     ) -> None:
         assert self.page is not None
 
@@ -1240,6 +1358,8 @@ class KeyDropSite:
                 "sell_offer_value": sell_offer_value,
                 "sell_clicked": sell_clicked,
                 "gain_value": gain_value,
+                "observations": observations or [],
+                "restriction_text": restriction_text,
             }
             json_file.write_text(
                 json.dumps(snapshot, indent=2, ensure_ascii=False),
@@ -1253,6 +1373,37 @@ class KeyDropSite:
             )
         except Exception:
             self.logger.exception("No se pudo capturar el diagnostico postapertura de KeyDrop.")
+
+    def capture_blocked_open_diagnostics(
+        self,
+        *,
+        status: str,
+        balance_text_before: str,
+        balance_value_before: float | None,
+        initial_button_text: str | None,
+        restriction_text: str | None,
+    ) -> None:
+        reward_candidates = self.collect_visible_text_candidates()
+        visible_buttons = self.collect_visible_button_texts()
+        self.capture_post_open_diagnostics(
+            status=status,
+            balance_text_before=balance_text_before,
+            balance_value_before=balance_value_before,
+            balance_text_after=None,
+            balance_value_after=None,
+            initial_button_text=initial_button_text,
+            reward_text=None,
+            reward_kind="unknown",
+            reward_candidates=reward_candidates,
+            visible_buttons_before_sell=visible_buttons,
+            visible_buttons_after_sell=visible_buttons,
+            sell_button_text=None,
+            sell_offer_value=None,
+            sell_clicked=False,
+            gain_value=None,
+            observations=[],
+            restriction_text=restriction_text,
+        )
 
     def is_ready_to_open(self, button_text: str) -> bool:
         if self.is_cooldown_active(button_text):
