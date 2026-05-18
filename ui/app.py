@@ -1865,6 +1865,8 @@ class DashboardWindow(QMainWindow):
                 status_item.setBackground(QColor("#d9d9d9"))
             elif result == "disabled" and self.should_show_historical_cooldown(row):
                 status_item.setBackground(QColor("#d9d9d9"))
+            elif result == "opened_exp":
+                status_item.setBackground(QColor("#a9e5b0"))
             elif result == "opened_sold":
                 status_item.setBackground(QColor("#5fd46b"))
             elif result == "aborted":

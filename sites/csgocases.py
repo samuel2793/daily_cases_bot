@@ -33,6 +33,10 @@ CASE_COOLDOWN_PATTERN = re.compile(
     r"\b\d+\s*h\b|\b\d+\s*min\b)",
     re.IGNORECASE,
 )
+CASE_AVAILABLE_PATTERN = re.compile(
+    r"(abre\s+gratis|abrir\s+ahora|open\s+now|open\s+free|claim\s+now)",
+    re.IGNORECASE,
+)
 
 
 class ManualFlowAborted(RuntimeError):
@@ -278,12 +282,17 @@ class CSGOCasesSite:
             )
             return "unknown"
 
-        if CASE_COOLDOWN_PATTERN.search(body_text):
-            cooldown_excerpt = self.extract_case_cooldown_excerpt(body_text)
+        case_text = self.extract_case_focus_text(body_text, case_label)
+        if CASE_AVAILABLE_PATTERN.search(case_text):
+            self.logger.info("%s parece disponible en CSGOCases.", case_label)
+            return "available"
+
+        if CASE_COOLDOWN_PATTERN.search(case_text):
+            cooldown_excerpt = self.extract_case_cooldown_excerpt(case_text)
             self.capture_case_availability_diagnostic(
                 case_label=case_label,
                 target_url=target_url,
-                body_text=body_text,
+                body_text=case_text,
                 cooldown_text=cooldown_excerpt,
                 status="cooldown",
             )
@@ -293,6 +302,10 @@ class CSGOCasesSite:
                 cooldown_excerpt,
             )
             return "cooldown"
+
+        if CASE_AVAILABLE_PATTERN.search(body_text):
+            self.logger.info("%s parece disponible en CSGOCases.", case_label)
+            return "available"
 
         self.logger.info("%s parece disponible en CSGOCases.", case_label)
         return "available"
@@ -454,6 +467,39 @@ class CSGOCasesSite:
         if not match:
             return "sin texto de cooldown"
         return match.group(0)
+
+    def extract_case_focus_text(self, body_text: str, case_label: str) -> str:
+        if not body_text:
+            return ""
+
+        label_tokens = [self.compact_text(case_label).lower()]
+        if "caja gratis 2" in case_label.lower():
+            label_tokens.extend(["caja gratis 2", "caja gratis"])
+        elif "caja gratis de csgocases" in case_label.lower():
+            label_tokens.extend(["caja gratis"])
+
+        normalized_body = body_text
+        lowered_body = normalized_body.lower()
+        best_index = -1
+        best_token = ""
+        for token in label_tokens:
+            index = lowered_body.find(token)
+            if index >= 0 and (best_index < 0 or index < best_index):
+                best_index = index
+                best_token = token
+
+        if best_index < 0:
+            return body_text
+
+        next_markers = ["las mejores recompensas", "© 2026", "terms and conditions"]
+        end_index = min(len(normalized_body), best_index + 1_500)
+        for marker in next_markers:
+            marker_index = lowered_body.find(marker, best_index + len(best_token))
+            if marker_index >= 0:
+                end_index = min(end_index, marker_index)
+
+        focus_text = normalized_body[best_index:end_index].strip()
+        return focus_text or body_text
 
     def capture_case_availability_diagnostic(
         self,

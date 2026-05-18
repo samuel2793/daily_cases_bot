@@ -544,6 +544,8 @@ class BloodyCaseSite:
                 visible_buttons_before_sell,
                 body_text=body_text,
             )
+            if reward_kind == "raffle":
+                reward_text = "Participacion en sorteos"
             sell_button_text_probe = self.find_sell_button_text()
             observation = {
                 "attempt": attempt,
@@ -648,6 +650,8 @@ class BloodyCaseSite:
 
         if not reward_text:
             status = "claim_unresolved"
+        elif reward_kind == "raffle":
+            status = "claim_raffle"
         else:
             status = "claim_sold" if sell_clicked else "claim_unsold"
         self.capture_post_claim_diagnostics(
@@ -925,6 +929,12 @@ class BloodyCaseSite:
         *,
         body_text: str | None = None,
     ) -> str | None:
+        if body_text and WINNING_MODAL_PATTERN.search(body_text) and (
+            RAFFLE_BUTTON_PATTERN.search(body_text)
+            or RAFFLE_REWARD_LABEL_PATTERN.search(body_text)
+        ):
+            return "Participacion en sorteos"
+
         raffle_button_texts = [
             text for text in visible_buttons if RAFFLE_BUTTON_PATTERN.search(text)
         ]

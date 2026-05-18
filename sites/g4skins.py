@@ -769,8 +769,15 @@ class G4SkinsSite:
             (text for text in visible_buttons if SELL_PATTERN.search(text)),
             None,
         )
+        if reward_text:
+            self.logger.info(
+                "Recompensa detectada en G4Skins tras abrir la caja: %s | Tipo: %s",
+                reward_text,
+                reward_kind,
+            )
+        status = "opened_exp" if reward_kind == "exp" else "opened_unsold"
         self.capture_diagnostics(
-            status="opened_unsold",
+            status=status,
             balance_text_before=balance_text_before,
             balance_value_before=balance_value_before,
             button_text=current_button_text,
@@ -780,7 +787,7 @@ class G4SkinsSite:
             visible_buttons=visible_buttons,
             sell_button_text=sell_button_text,
         )
-        return "opened_unsold"
+        return status
 
     def collect_visible_text_candidates(self) -> list[dict[str, Any]]:
         assert self.page is not None
