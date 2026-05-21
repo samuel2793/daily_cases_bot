@@ -38,7 +38,7 @@ CLAIM_BUTTON_TEXT_XPATH = (
     "/html/body/app-root/layout/div/div/div/div/daily-free-layout/div/df-daily-cases/div/div/button[1]/div[1]/div/div[2]"
 )
 LOGIN_PATTERN = re.compile(r"(iniciar sesi[oó]n|login|sign in|steam)", re.IGNORECASE)
-CLAIM_PATTERN = re.compile(r"\bclaim\b", re.IGNORECASE)
+CLAIM_PATTERN = re.compile(r"\b(claim|reclamar)\b", re.IGNORECASE)
 SELL_PATTERN = re.compile(r"(vender|sell)", re.IGNORECASE)
 RAFFLE_BUTTON_PATTERN = re.compile(
     r"(participar en sorteos|participar en sorteo|join giveaways|giveaways?)",
